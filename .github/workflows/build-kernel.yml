@@ -31,14 +31,50 @@ jobs:
     timeout-minutes: 240
 
     steps:
-      # ---------------------------------------------------------------- workspace
-      # GitHub runners have only ~14 GB free on /, but ~70+ GB on /mnt.
-      # An ACK + kleaf build needs ~40 GB, so everything lives under /mnt.
-      - name: Prepare large workspace on /mnt
+      # ---------------------------------------------------------------- workspace + disk
+      # FAILED RUN #1 LESSON: "System.IO.IOException: No space left on device:
+      #   /home/runner/actions-runner/cached/.../_diag/Worker_....log"
+      # That killed the RUNNER ITSELF at 1m44s: the runner's own logs live on /, and the
+      # stock ubuntu-latest image leaves / nearly full. So: free space first, then pick
+      # whichever mount actually has room, and fail loudly if neither does.
+      - name: Free disk space and choose the build mount
         run: |
-          sudo mkdir -p /mnt/kernel_workspace
-          sudo chown -R "$(id -u):$(id -g)" /mnt/kernel_workspace
-          df -h / /mnt
+          echo "================= BEFORE ================="
+          df -h / /mnt 2>/dev/null || df -h
+
+          # standard, transparent space reclaim (no third-party action)
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      /usr/share/swift /usr/lib/jvm /usr/local/lib/node_modules \
+                      /opt/az /usr/share/miniconda /usr/local/.ghcup \
+                      /usr/lib/google-cloud-sdk "$AGENT_TOOLSDIRECTORY" 2>/dev/null || true
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          sudo swapoff -a >/dev/null 2>&1 || true
+          sudo rm -f /swapfile /mnt/swapfile >/dev/null 2>&1 || true
+          sudo apt-get clean >/dev/null 2>&1 || true
+
+          echo "================= AFTER ================="
+          df -h / /mnt 2>/dev/null || df -h
+
+          # pick the mount with the most free space (numbers only, in GB)
+          A=$(df -BG --output=avail / 2>/dev/null | tail -1 | tr -dc '0-9'); A=${A:-0}
+          B=$(df -BG --output=avail /mnt 2>/dev/null | tail -1 | tr -dc '0-9'); B=${B:-0}
+          echo "/ has ${A}GB   /mnt has ${B}GB   (need ~40GB)"
+
+          if [ "$B" -gt "$A" ] && [ "$B" -ge 40 ]; then
+            WD=/mnt/kernel_workspace
+          elif [ "$A" -ge 40 ]; then
+            WD="$HOME/kernel_workspace"
+          else
+            echo "::error::Not enough disk space (${A}GB on /, ${B}GB on /mnt). Need ~40GB."
+            df -h
+            exit 1
+          fi
+          mkdir -p "$WD"
+          echo "WORKDIR=$WD" >> "$GITHUB_ENV"
+          echo "chosen WORKDIR = $WD"
+          df -h "$WD"
+
 
       - name: Install repo tool
         run: |
@@ -52,16 +88,16 @@ jobs:
 
       # ---------------------------------------------------------------- sync
       - name: repo init + sync ACK android13-5.15-2026-03 (v5.15.197)
-        working-directory: /mnt/kernel_workspace
         run: |
+          cd "$WORKDIR"
           repo init -u https://android.googlesource.com/kernel/manifest \
                     -b common-android13-5.15-2026-03
           repo sync -j8 --no-tags --current-branch
-          du -sh /mnt/kernel_workspace
+          du -sh "$WORKDIR"
 
       - name: Verify source kernel version is exactly 5.15.197
-        working-directory: /mnt/kernel_workspace
         run: |
+          cd "$WORKDIR"
           set -e
           KV=$(awk '/^VERSION =/{a=$3} /^PATCHLEVEL =/{b=$3} /^SUBLEVEL =/{c=$3} END{print a"."b"."c}' common/Makefile)
           echo "source version: $KV"
@@ -70,8 +106,8 @@ jobs:
 
       # ---------------------------------------------------------------- KernelSU-Next
       - name: Integrate KernelSU-Next (${{ inputs.ksu_branch }})
-        working-directory: /mnt/kernel_workspace/common
         run: |
+          cd "$WORKDIR/common"
           set -e
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/${{ inputs.ksu_branch }}/kernel/setup.sh" \
             | bash -s "${{ inputs.ksu_branch }}"
@@ -81,8 +117,8 @@ jobs:
 
       # ---------------------------------------------------------------- SUSFS
       - name: Apply SUSFS (${{ inputs.susfs_branch }})
-        working-directory: /mnt/kernel_workspace
         run: |
+          cd "$WORKDIR"
           set -e
           git clone --depth=1 -b "${{ inputs.susfs_branch }}" \
             https://gitlab.com/simonpunk/susfs4ksu.git /tmp/susfs4ksu
@@ -98,8 +134,8 @@ jobs:
 
       # ---------------------------------------------------------------- config
       - name: Enable KSU + SUSFS and pin the version string
-        working-directory: /mnt/kernel_workspace/common
         run: |
+          cd "$WORKDIR/common"
           set -e
           DEF=arch/arm64/configs/gki_defconfig
           cp "$DEF" "$DEF.bak"
@@ -125,8 +161,8 @@ jobs:
 
       # ---------------------------------------------------------------- build
       - name: kleaf build //common:kernel_aarch64_dist
-        working-directory: /mnt/kernel_workspace
         run: |
+          cd "$WORKDIR"
           set -o pipefail
           # the same two fixes the earlier CI run applied
           rm -rf ./common/android/abi_gki_protected_exports_*
@@ -135,8 +171,8 @@ jobs:
 
       # ---------------------------------------------------------------- verify + upload
       - name: Inspect and collect all build outputs
-        working-directory: /mnt/kernel_workspace
         run: |
+          cd "$WORKDIR"
           set -e
           DIST=bazel-bin/common/kernel_aarch64_dist
           echo "================= dist listing ================="
@@ -151,22 +187,29 @@ jobs:
             echo "(none found - KSU may be built as a loadable module)"
           echo "--- version string baked into the kernel ---"
           strings -a bazel-bin/common/kernel_aarch64/Image | grep -m3 -E '5\.15\.197' || true
-          mkdir -p /mnt/artifacts
-          # the whole dist if it exists (may include a ready-made boot.img), else the raw kernel
-          if [ -d "$DIST" ]; then
-            cp -rv "$DIST"/* /mnt/artifacts/ 2>/dev/null || true
-          fi
-          cp -v bazel-bin/common/kernel_aarch64/Image     /mnt/artifacts/ 2>/dev/null || true
-          cp -v bazel-bin/common/kernel_aarch64/Image.lz4 /mnt/artifacts/ 2>/dev/null || true
-          echo "================= artifacts ================="
-          ls -la /mnt/artifacts
+          # Only copy the small, flashable outputs. The full dist includes vmlinux (hundreds of MB)
+          # which would blow the runner's disk AND the artifact size.
+          # RUNNER_TEMP is a documented, fixed path - safer than the dynamic WORKDIR here.
+          ART="$RUNNER_TEMP/artifacts"
+          rm -rf "$ART"; mkdir -p "$ART"
+          for f in bazel-bin/common/kernel_aarch64/Image \
+                   bazel-bin/common/kernel_aarch64/Image.lz4 \
+                   "$DIST"/boot.img "$DIST"/Image "$DIST"/Image.lz4 "$DIST"/kernel_aarch64.bzl ; do
+            if [ -f "$f" ]; then cp -v "$f" "$ART"/; fi
+          done
+          echo "================= artifacts to upload ================="
+          ls -la "$ART"
+          echo "================= final disk ================="
+          df -h "$WORKDIR" "$RUNNER_TEMP"
 
       - name: Upload kernel artifacts
         uses: actions/upload-artifact@v4
         with:
           name: kernel-Image-${{ github.run_number }}
-          path: /mnt/artifacts/*
+          path: ${{ runner.temp }}/artifacts/*
           if-no-files-found: error
           retention-days: 14
+
+
 
 
