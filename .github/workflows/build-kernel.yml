@@ -456,21 +456,27 @@ jobs:
         run: |
           cd "$WORKDIR"
           rm -rf ./common/android/abi_gki_protected_exports_*
-          # RUN #13 LESSON - KILL THE "-maybe-dirty" SUFFIX AT ITS SOURCE (first of two places).
+          # RUN #13/#14 LESSON - KILL THE "-maybe-dirty" SUFFIX AT ITS SOURCE (first of two places).
           # It is NOT a stray string: the pinned kleaf's own stamp rule contains
           #     export LOCALVERSION="-maybe-dirty"
           # (build/kernel/kleaf/impl/stamp.bzl, _set_localversion_cmd) and kleaf exports it whenever
           # --config=stamp is absent, which is our case because --config=fast implies --config=local.
           # kbuild appends LOCALVERSION to the end of KERNELRELEASE, which is exactly where the
-          # suffix appeared in run #12. Strip the literal so the export becomes LOCALVERSION="",
-          # print the line before and after as proof, and fail in seconds - not after a 50 minute
-          # build - if any occurrence survives.
+          # suffix appeared in run #12. Strip the literal so the export becomes LOCALVERSION="", and
+          # print the line before and after as proof.
+          # NOTE: the file list is collected separately, NOT in a pipeline - run #14 showed that
+          # under `set -o pipefail` a grep that matches nothing returns 1 and `set -e` kills the
+          # step. Empty means already stripped (this runs in two steps), which is a success.
           echo "--- stamp.bzl LOCALVERSION before strip ---"
           grep -rn 'LOCALVERSION=' ./build/kernel/kleaf/impl/stamp.bzl 2>/dev/null || true
           grep -rnI -- "-maybe-dirty" ./build ./common/scripts 2>/dev/null | head -20 || true
-          grep -rlI -- "-maybe-dirty" ./build ./common/scripts 2>/dev/null | while read -r f; do
-            sed -i 's/-maybe-dirty//g' "$f"
-          done
+          MD_FILES=$(grep -rlI -- "-maybe-dirty" ./build ./common/scripts 2>/dev/null || true)
+          if [ -n "$MD_FILES" ]; then
+            echo "stripping: $MD_FILES"
+            echo "$MD_FILES" | while read -r f; do sed -i 's/-maybe-dirty//g' "$f"; done
+          else
+            echo "(nothing left to strip - already handled)"
+          fi
           echo "--- stamp.bzl LOCALVERSION after strip ---"
           grep -rn 'LOCALVERSION=' ./build/kernel/kleaf/impl/stamp.bzl 2>/dev/null || true
           if grep -rqI -- "-maybe-dirty" ./build ./common/scripts 2>/dev/null; then
@@ -560,9 +566,15 @@ jobs:
           echo "--- stamp.bzl LOCALVERSION before strip ---"
           grep -rn 'LOCALVERSION=' ./build/kernel/kleaf/impl/stamp.bzl 2>/dev/null || true
           grep -rnI -- "-maybe-dirty" ./build ./common/scripts 2>/dev/null | head -20 || true
-          grep -rlI -- "-maybe-dirty" ./build ./common/scripts 2>/dev/null | while read -r f; do
-            sed -i 's/-maybe-dirty//g' "$f"
-          done
+          # Pipefail-safe: run #14 died here because a grep with no matches returns 1 and set -e
+          # aborts the step. "no matches" is success by this point (step 11 strips first).
+          MD_FILES=$(grep -rlI -- "-maybe-dirty" ./build ./common/scripts 2>/dev/null || true)
+          if [ -n "$MD_FILES" ]; then
+            echo "stripping: $MD_FILES"
+            echo "$MD_FILES" | while read -r f; do sed -i 's/-maybe-dirty//g' "$f"; done
+          else
+            echo "(nothing left to strip - already handled in the smoke-test step)"
+          fi
           echo "--- stamp.bzl LOCALVERSION after strip ---"
           grep -rn 'LOCALVERSION=' ./build/kernel/kleaf/impl/stamp.bzl 2>/dev/null || true
           if grep -rqI -- "-maybe-dirty" ./build ./common/scripts 2>/dev/null; then
