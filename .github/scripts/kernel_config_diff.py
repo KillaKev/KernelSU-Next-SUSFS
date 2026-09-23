@@ -21,12 +21,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_STOCK = os.path.normpath(os.path.join(HERE, "..", "boot-template", "stock-config.txt"))
 
 # Deliberate differences, and only these:
-#   CONFIG_KSU*          our KernelSU-Next + SUSFS options
-#   CONFIG_LOCALVERSION  we pin the full suffix here because kleaf's non-stamp path disables
-#                        CONFIG_LOCALVERSION_AUTO; the two cancel out and the release string is stock
-#   UNUSED_KSYMS_WHITELIST   the path to the generated ABI symbol list is inherently build-machine
-ALLOWED = re.compile(
-    r"^CONFIG_(KSU|KSU_SUSFS|KSU_THRONE|LOCALVERSION|LOCALVERSION_AUTO|UNUSED_KSYMS_WHITELIST)")
+#   CONFIG_KSU*             our KernelSU-Next + SUSFS options
+#   UNUSED_KSYMS_WHITELIST  the path to the generated ABI symbol list is inherently build-machine
+# LOCALVERSION and LOCALVERSION_AUTO were allowed until run #18; they are now expected to MATCH stock
+# too (the build passes --config=stamp, so kleaf keeps LOCALVERSION_AUTO=y and resolves the version
+# from common/.scmversion), so drift there is a failure again.
+ALLOWED = re.compile(r"^CONFIG_(KSU|KSU_SUSFS|KSU_THRONE|UNUSED_KSYMS_WHITELIST)")
 
 
 def parse(text):

@@ -530,7 +530,15 @@ jobs:
           python3 "$GITHUB_WORKSPACE/.github/scripts/patch_setup_env.py" "$WORKDIR"
 
           echo "============ build the config target ============"
-          tools/bazel build --lto=full //common:kernel_aarch64_config
+          # RUN #18 LESSON - --config=stamp is REQUIRED, not optional.
+          # The stock config has CONFIG_LOCALVERSION_AUTO=y AND CONFIG_MODULE_SCMVERSION=y, and
+          # common/init/Kconfig:2167 says MODULE_SCMVERSION `depends on LOCALVERSION_AUTO`. kleaf's
+          # non-stamp path runs `scripts/config -d LOCALVERSION_AUTO`, so without stamp MODULE_SCMVERSION
+          # can never be enabled - and MODULE_SCMVERSION is part of the MODULE vermagic that the stock
+          # vendor modules carry, so a kernel missing it refuses to load them.
+          # With stamp on, kleaf reads common/.scmversion (step 6 pins it to the exact stock value) and
+          # the release string comes from the real SCM machinery, exactly as Google builds it.
+          tools/bazel build --config=stamp --lto=full //common:kernel_aarch64_config
 
           echo "============ did the options actually land? ============"
           CFG=$(find "$WORKDIR/out" -path '*/android13-5.15/common/.config' 2>/dev/null | head -1)
@@ -678,13 +686,14 @@ jobs:
           WATCH_PID=$!
           trap 'kill "$WATCH_PID" 2>/dev/null || true' EXIT
 
-          # NOTE ON --config=stamp: kleaf's own switch of that name is the "official" way to stop it
-          # exporting LOCALVERSION="-maybe-dirty", but it cannot be combined with --config=local, and
-          # --config=fast implies local - which is also what keeps this build in-tree where the SUSFS
-          # patches live. So the literal is stripped above instead (a one-line change to the pinned
-          # kleaf that affects only the bogus suffix), the SCM part is pinned in common/.scmversion,
-          # and the inspect step then verifies the result against the stock string exactly.
-          tools/bazel build --config=fast --lto=full --stamp ${{ inputs.build_target }}
+          # RUN #18 LESSON - the flags are now settled by evidence, not by my earlier guess that
+          # --config=stamp cannot coexist with --config=local. --config=stamp is required: it keeps
+          # CONFIG_LOCALVERSION_AUTO enabled (which CONFIG_MODULE_SCMVERSION depends on) and makes kleaf
+          # resolve the version from common/.scmversion - which step 6 pins to the exact stock string -
+          # instead of exporting the "-maybe-dirty" placeholder. The literal is still stripped above as
+          # belt and braces, and --lto=full matches the stock kernel's CONFIG_LTO_CLANG_FULL.
+          # If bazel rejects this combination the smoke test above fails fast and says so.
+          tools/bazel build --config=fast --config=stamp --lto=full --stamp ${{ inputs.build_target }}
           RC=$?
 
           kill "$WATCH_PID" 2>/dev/null || true
