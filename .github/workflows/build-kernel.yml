@@ -436,7 +436,16 @@ jobs:
         run: |
           cd "$WORKDIR"
           rm -rf ./common/android/abi_gki_protected_exports_*
-          sed -i "/stable_scmversion_cmd/s/-maybe-dirty//g" ./build/kernel/kleaf/impl/stamp.bzl
+          # RUN #12 LESSON - KILL THE "-maybe-dirty" SUFFIX FOR REAL (first of two places; see the
+          # build step for the full explanation). The old one-line sed only rewrote lines that
+          # themselves contained "stable_scmversion_cmd" in a single file, and it never matched.
+          echo "--- -maybe-dirty before strip (must name the offending file) ---"
+          grep -rnI -- "-maybe-dirty" ./build ./common/scripts 2>/dev/null | head -20 || true
+          grep -rlI -- "-maybe-dirty" ./build ./common/scripts 2>/dev/null | while read -r f; do
+            sed -i 's/-maybe-dirty//g' "$f"
+          done
+          echo "--- -maybe-dirty after strip (must be empty) ---"
+          grep -rnI -- "-maybe-dirty" ./build ./common/scripts 2>/dev/null | head -20 || true
 
           echo "============ append the options to gki_defconfig ============"
           DEF=./common/arch/arm64/configs/gki_defconfig
@@ -504,7 +513,26 @@ jobs:
           set -o pipefail
           # (the smoke-test step already applied these two fixes and neutralised check_defconfig)
           rm -rf ./common/android/abi_gki_protected_exports_*
-          sed -i "/stable_scmversion_cmd/s/-maybe-dirty//g" ./build/kernel/kleaf/impl/stamp.bzl
+          # RUN #12 LESSON - KILL THE "-maybe-dirty" SUFFIX FOR REAL.
+          # The built Image reported
+          #     5.15.197-android13-8-00005-g2d8ad9139b89-ab15063902-maybe-dirty
+          # while the stock device reports (nothing_stock_baseline/boot_state.txt)
+          #     5.15.197-android13-8-00005-g2d8ad9139b89-ab15063902
+          # The ACK revision (g2d8ad9139b89) and the build id (ab15063902) match EXACTLY, so
+          # "-maybe-dirty" is the only difference - and it lands in UTS_RELEASE, therefore in the
+          # vermagic that the device's 235 vendor modules (and Nothing's Wallet/Fenrir attestation)
+          # compare against. With it present they all reject the kernel. The old one-line sed only
+          # rewrote lines that themselves contained "stable_scmversion_cmd" in a single file, which
+          # evidently never matched, so the strip now covers both trees that can produce the version
+          # string. The inspect step below FAILS the run if the suffix survives, so a kernel that
+          # cannot load its modules can never be uploaded silently.
+          echo "--- -maybe-dirty before strip (must name the offending file) ---"
+          grep -rnI -- "-maybe-dirty" ./build ./common/scripts 2>/dev/null | head -20 || true
+          grep -rlI -- "-maybe-dirty" ./build ./common/scripts 2>/dev/null | while read -r f; do
+            sed -i 's/-maybe-dirty//g' "$f"
+          done
+          echo "--- -maybe-dirty after strip (must be empty) ---"
+          grep -rnI -- "-maybe-dirty" ./build ./common/scripts 2>/dev/null | head -20 || true
 
           # RUN #7/#8 LESSON. This step got 30+ min into the kernel compile and was then killed by
           # an ORDERLY SIGTERM - with no compile error, no ENOSPC and no OOM anywhere in the log:
@@ -582,6 +610,28 @@ jobs:
             echo "(none found - KSU may be built as a loadable module)"
           echo "--- version string baked into the kernel ---"
           strings -a bazel-bin/common/kernel_aarch64/Image | grep -m3 -E '5\.15\.197' || true
+
+          # RUN #12 LESSON - THE CHECK THAT DECIDES WHETHER THE PHONE ACCEPTS THIS KERNEL.
+          # The stock kernel (nothing_stock_baseline/boot_state.txt) is exactly
+          #     5.15.197-android13-8-00005-g2d8ad9139b89-ab15063902
+          # and the build must reproduce that string exactly: it IS UTS_RELEASE, so it is part of the
+          # vermagic that the vendor modules and the Wallet/Fenrir attestation compare against. Run
+          # #12 built "...-ab15063902-maybe-dirty", which no stock module would accept, so the suffix
+          # is stripped before the build and its survival is a hard failure here - a kernel that
+          # cannot load its modules must never be uploaded.
+          EXPECT="5.15.197-android13-8-00005-g2d8ad9139b89-ab15063902"
+          if strings -a bazel-bin/common/kernel_aarch64/Image | grep -qxF "$EXPECT"; then
+            echo "OK   release string reproduces the stock kernel exactly: $EXPECT"
+          else
+            echo "::error::the built Image does NOT contain the exact stock release string $EXPECT"
+            strings -a bazel-bin/common/kernel_aarch64/Image | grep -m5 -E '5\.15\.197' || true
+            exit 1
+          fi
+          if strings -a bazel-bin/common/kernel_aarch64/Image | grep -q -- '-maybe-dirty'; then
+            echo "::error::the Image still carries -maybe-dirty, so vermagic will not match the stock device"
+            exit 1
+          fi
+          echo "OK   no -maybe-dirty suffix anywhere in the kernel"
           # Only copy the small, flashable outputs. The full dist includes vmlinux (hundreds of MB)
           # which would blow the runner's disk AND the artifact size.
           # RUNNER_TEMP is a documented, fixed path - safer than the dynamic WORKDIR here.
