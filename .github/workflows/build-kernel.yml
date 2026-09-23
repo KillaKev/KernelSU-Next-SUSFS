@@ -107,27 +107,32 @@ jobs:
           git config --global color.ui false
 
       # ---------------------------------------------------------------- sync
-      # WildKernels' download-kernel action is deliberately SHALLOW and lean, and that is a large part
-      # of why their builds survive a runner ours died on:
+      # RUN #10 LESSON - THE SHALLOW-SYNC TRICK DOES NOT TRANSFER TO OUR REPO TOOL.
+      # WildKernels' download-kernel action syncs shallowly:
       #     repo init --depth=1 ...  ;  repo sync -c --current-branch --no-clone-bundle -j4 --jobs-checkout=4
-      # A plain `repo sync` clones the FULL history of every project - several GB of git objects we
-      # never read, on the one resource ubuntu-latest cannot give us more of.
+      # Copying that here failed in 3 seconds, and the run's own log says exactly why:
+      #     repo has been initialized in /home/runner/kernel_workspace   <- repo init --depth=1 was FINE
+      #     Usage: repo sync [<project>...]
+      #     main.py: error: no such option: --depth                     <- but repo SYNC has no --depth
+      # --depth is a `repo init` option in the current repo tool, not a `repo sync` option. Even from
+      # init it is not safe to flip blindly: repo gates shallow cloning behind the REPO_ALLOW_SHALLOW
+      # environment variable (the constant is read in both subcmds/init.py and subcmds/sync.py), so
+      # keeping it would be one more guess - and every guess costs a full dispatch.
       #
-      # Is a shallow clone safe for a kleaf build? Yes, and we have direct evidence rather than a
-      # guess: the previous sync already passed --no-tags, i.e. NO tags were fetched at all, and
-      # kleaf's stamp step (which runs `git describe` - see the stable_scmversion_cmd sed in the build
-      # step) still completed, because runs #7 and #8 both got ~30 min deep into the kernel compile
-      # under that arrangement. Depth imposes no constraint that --no-tags had not already imposed.
-      # CONFIG_LOCALVERSION is pinned in susfs.config, and the vermagic that decides whether the 235
-      # vendor modules load is gated on symbol CRCs from the same KMI branch, not on git history.
+      # We also do not need it. Run #10's watchdog - the first run to stream a sample - measured
+      #     free=45GB  mem_used=2369MB mem_avail=5569MB swap_used=0MB
+      # at build start WITH a full sync, and an Image-only build needs nowhere near 45 GB. Disk was
+      # never the binding constraint by itself; building every GKI module was. So this step is now
+      # byte-for-byte what the known-good runs #7/#8/#9 used - only the build target differs - which
+      # keeps one variable at a time and makes any next failure unambiguous.
       - name: repo init + sync ACK android13-5.15-2026-03 (v5.15.197)
         run: |
           cd "$WORKDIR"
           set -e
           echo "disk before sync:"; df -h "$WORKDIR" | tail -1
           repo init -u https://android.googlesource.com/kernel/manifest \
-                    -b common-android13-5.15-2026-03 --depth=1
-          repo sync -c --current-branch --no-clone-bundle --depth=1 -j4 --jobs-checkout=4
+                    -b common-android13-5.15-2026-03
+          repo sync -j8 --no-tags --current-branch
           echo "disk after sync:"; df -h "$WORKDIR" | tail -1
           du -sh "$WORKDIR"
 
@@ -147,8 +152,9 @@ jobs:
           # In a repo-managed checkout each project's .git is only a POINTER into .repo/projects/...
           # (alternates point at .repo/project-objects/...), so removing .repo leaves common/.git
           # dangling and kleaf's rsync into the action sandbox fails within seconds. The space is won
-          # the right way instead: a shallow sync keeps .repo itself small, and the kernel-only build
-          # target skips the whole GKI module tree. Just record the sizes here.
+          # the right way instead: the kernel-only build target below skips the whole GKI module tree,
+          # which is tens of GB and was the real hog - see the free=45GB sample in the sync comment.
+          # Just record the sizes here.
           echo "============ disk + .repo size (keep .repo - see comment) ============"
           df -h "$WORKDIR" | tail -1
           du -sh "$WORKDIR/.repo" 2>/dev/null || true
