@@ -227,6 +227,15 @@ jobs:
           fi
           echo "--- .rej remaining after repair ---"
           find . -name '*.rej' | sort || true
+          # Dump their CONTENTS too. Run #4 taught us this the hard way: the old step `cat`ed every
+          # .rej, my replacement only listed names, so the KernelSU-Next rejects became
+          # undiagnosable - and those are exactly the hunks we may still have to hand-port if the
+          # build later fails on a ksu_*/susfs_* symbol.
+          for r in $(find . -name '*.rej' | sort); do
+            echo ""
+            echo "----- $r -----"
+            cat "$r"
+          done
           if [ "$rc" -ne 0 ]; then
             echo "::error::SUSFS integration is incomplete - stopping before the build"
             exit 1
