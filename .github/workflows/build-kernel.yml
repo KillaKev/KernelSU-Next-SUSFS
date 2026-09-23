@@ -250,14 +250,12 @@ jobs:
         run: |
           cd "$WORKDIR/common"
           set -e
-          # The canonical option list lives in this repo, so the fragment and the fallback
-          # cannot drift apart.
+          # The canonical option list lives in this repo.
           OPT="$GITHUB_WORKSPACE/.github/scripts/susfs.config"
           test -f "$OPT"
-          cp -v "$OPT" susfs.fragment
           cp -v "$OPT" "$RUNNER_TEMP/susfs.config"
-          echo "--- common/susfs.fragment ---"
-          cat susfs.fragment
+          echo "--- $OPT ---"
+          cat "$OPT"
           echo "--- gki_defconfig untouched so far ---"
           git status --short arch/arm64/configs/gki_defconfig || true
           # sanity: the kernel-side patch must have produced the SUSFS source files
@@ -272,23 +270,28 @@ jobs:
           rm -rf ./common/android/abi_gki_protected_exports_*
           sed -i "/stable_scmversion_cmd/s/-maybe-dirty//g" ./build/kernel/kleaf/impl/stamp.bzl
 
-          echo "============ attempt 1: fragment on the command line ============"
-          if tools/bazel build \
-               --defconfig_fragment=//common:susfs.fragment \
-               //common:kernel_aarch64_config; then
-            echo "OK - the config target accepted --defconfig_fragment"
-            echo "FRAG_FLAG=--defconfig_fragment=//common:susfs.fragment" >> "$GITHUB_ENV"
-          else
-            echo "::warning::fragment route failed - falling back to defconfig + check_defconfig=False"
-            echo "============ attempt 2: append to defconfig, check disabled ============"
-            cp ./common/arch/arm64/configs/gki_defconfig /tmp/gki_defconfig.orig
-            cat "$RUNNER_TEMP/susfs.config" >> ./common/arch/arm64/configs/gki_defconfig
-            echo "--- defconfig tail ---"
-            tail -14 ./common/arch/arm64/configs/gki_defconfig
-            python3 "$GITHUB_WORKSPACE/.github/scripts/patch_build_bazel.py" "$WORKDIR/common"
-            echo "FRAG_FLAG=" >> "$GITHUB_ENV"
-            tools/bazel build //common:kernel_aarch64_config
-          fi
+          echo "============ append the options to gki_defconfig ============"
+          cp ./common/arch/arm64/configs/gki_defconfig /tmp/gki_defconfig.orig
+          cat "$RUNNER_TEMP/susfs.config" >> ./common/arch/arm64/configs/gki_defconfig
+          echo "--- defconfig tail ---"
+          tail -14 ./common/arch/arm64/configs/gki_defconfig
+
+          echo "============ force kleaf's check_defconfig to disabled ============"
+          # RUN #4 LESSON: --defconfig_fragment does NOT exist in this kleaf vintage
+          # ("Unrecognized option: --defconfig_fragment"), and common/BUILD.bazel has no
+          # kernel_build() call to edit - it is `define_common_kernels(target_configs = {...})`.
+          # The guard we keep hitting lives in build/kernel/kleaf/common_kernels.bzl as:
+          #     check_defconfig = select({
+          #         Label("//build/kernel/kleaf:gki_build_config_fragment_is_unset"):
+          #             "match" if pre_defconfig_fragments else "minimized",
+          #         "//conditions:default": "disabled",
+          #     })
+          # i.e. a pure GKI build does the strict savedefconfig comparison. Force "disabled";
+          # the .config grep below is the check that actually matters.
+          python3 "$GITHUB_WORKSPACE/.github/scripts/disable_check_defconfig.py" "$WORKDIR"
+
+          echo "============ build the config target ============"
+          tools/bazel build //common:kernel_aarch64_config
 
           echo "============ did the options actually land in .config? ============"
           CFG=$(find "$WORKDIR/out" -path '*/android13-5.15/common/.config' 2>/dev/null | head -1)
@@ -317,11 +320,10 @@ jobs:
         run: |
           cd "$WORKDIR"
           set -o pipefail
-          echo "using fragment flag: '${FRAG_FLAG:-<none>}'"
-          # the same two fixes the earlier CI run applied
+          # (the smoke-test step already applied these two fixes and disabled check_defconfig)
           rm -rf ./common/android/abi_gki_protected_exports_*
           sed -i "/stable_scmversion_cmd/s/-maybe-dirty//g" ./build/kernel/kleaf/impl/stamp.bzl
-          tools/bazel build --config=fast --stamp ${FRAG_FLAG} //common:kernel_aarch64_dist
+          tools/bazel build --config=fast --stamp //common:kernel_aarch64_dist
 
       # ---------------------------------------------------------------- verify + upload
       - name: Inspect and collect all build outputs
