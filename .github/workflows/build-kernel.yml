@@ -286,58 +286,52 @@ jobs:
           echo "--- defconfig tail ---"
           tail -14 "$DEF"
 
-          echo "============ attempt 1: build the config target ============"
-          if tools/bazel build //common:kernel_aarch64_config; then
-            echo "OK - the config target accepted the edited defconfig"
-          else
-            # RUN #5 LESSON: the pinned kleaf is `master-kernel-build-2022` (from the manifest's
-            # <default revision=...>; build/kernel has no explicit revision). In that vintage:
-            #   * --defconfig_fragment does not exist ("Unrecognized option")
-            #   * `check_defconfig` appears NOWHERE in kleaf/ (verified against the real archive),
-            #     so there is no attribute to flip
-            #   * the guard is a plain textual comparison of `make savedefconfig` output against
-            #     the defconfig FILE - and it writes the defconfig it expects (run #3's diff
-            #     header showed its path).
-            # So instead of fighting it: adopt that file. The comparison then passes by
-            # construction. Our options survive because savedefconfig emits every non-default
-            # value, and anything sitting at its default (CONFIG_KSU is `default y`) stays
-            # enabled regardless - which the .config grep below proves.
-            echo "::warning::config target rejected the edited defconfig - adopting kleaf's own canonical defconfig"
-            GEN=$(find "$WORKDIR/out" -path '*android13-5.15/common/defconfig' 2>/dev/null | head -1)
-            echo "kleaf's generated defconfig: ${GEN:-<not found>}"
-            if [ -n "$GEN" ]; then
-              echo "--- what kleaf expects (first 25 lines) ---"
-              head -25 "$GEN"
-              echo "--- KSU lines in it (absent is fine only if the symbol defaults to y) ---"
-              grep -nE '^CONFIG_(KSU|KSU_SUSFS)' "$GEN" || echo "(none)"
-              cp "$GEN" "$DEF"
-              echo "--- defconfig adopted; retrying the config target ---"
-              tools/bazel build //common:kernel_aarch64_config
-            else
-              echo "::error::could not find kleaf's generated defconfig to adopt"
-              echo "--- for next time: where does the check come from? ---"
-              grep -rl 'savedefconfig' "$WORKDIR/build" "$WORKDIR/common/Makefile" 2>/dev/null | head -10 || true
-              exit 1
-            fi
-          fi
+          echo "============ neutralise the legacy check_defconfig guard ============"
+          # RUN #6 LESSON: the guard is not in kleaf at all. It is a bash function in
+          # build/kernel/_setup_env.sh (kernel/build's root; the manifest links it to
+          # build/_setup_env.sh) that is `export -f`-ed so the ACK's config step can call it. It
+          # diffs `make savedefconfig` output against the defconfig FILE, and that generated file
+          # lives inside the action's sandbox - it is GONE once the action fails, which is why
+          # run #6's "adopt the canonical defconfig" idea could not find it. Making the function
+          # return 0 is deterministic and does not care which call site invokes it.
+          # (For the record, the pinned kleaf is `master-kernel-build-2022`: no --defconfig_fragment
+          # flag and no check-defconfig attribute anywhere in its 131 files, which is why the
+          # earlier attempts failed.)
+          python3 "$GITHUB_WORKSPACE/.github/scripts/patch_setup_env.py" "$WORKDIR"
 
-          echo "============ did the options actually land in .config? ============"
+          echo "============ build the config target ============"
+          tools/bazel build //common:kernel_aarch64_config
+
+          echo "============ did the options actually land? ============"
           CFG=$(find "$WORKDIR/out" -path '*/android13-5.15/common/.config' 2>/dev/null | head -1)
           if [ -z "$CFG" ]; then
             CFG=$(find "$WORKDIR/out" -name '.config' -path '*common*' 2>/dev/null | head -1)
           fi
           echo "generated .config: ${CFG:-<not found>}"
           if [ -z "$CFG" ]; then
-            echo "::warning::could not find the generated .config - the post-build marker grep is the backstop"
+            # RUN #6 LESSON: the config action runs in a sandbox, so nothing it writes is guaranteed
+            # to survive on disk (that is why the generated defconfig could not be found). Fall back
+            # to an artifact kleaf CAN leave in the source tree: `run` with the default savedefconfig
+            # action copies the minimized defconfig back over gki_defconfig and prints the path.
+            echo "--- asking kleaf to write back the minimized defconfig ---"
+            tools/bazel run //common:kernel_aarch64_config 2>&1 | tail -15 || true
+            echo "--- KSU / SUSFS lines now in $DEF (CONFIG_KSU may be absent: it is 'default y') ---"
+            grep -nE '^CONFIG_(KSU|KSU_SUSFS)|^# CONFIG_KSU' "$DEF" || echo "(none)"
+            WANT=$(grep -cE '^CONFIG_KSU_SUSFS' "$GITHUB_WORKSPACE/.github/scripts/susfs.config" | tr -dc '0-9')
+            GOT=$(grep -cE '^CONFIG_KSU_SUSFS' "$DEF" | tr -dc '0-9')
+            echo "SUSFS options requested: ${WANT:-0}   present in the written-back defconfig: ${GOT:-0}"
+            if [ "${GOT:-0}" -eq 0 ]; then
+              echo "::warning::could not observe the SUSFS options in either artifact - the post-build marker grep is the backstop"
+            fi
           else
             echo "--- KSU lines ---"
             grep -nE '^CONFIG_(KSU|KSU_SUSFS)|^# CONFIG_KSU' "$CFG" || echo "(no KSU lines at all)"
             grep -qE '^CONFIG_KSU=y'       "$CFG" || { echo "::error::CONFIG_KSU is not =y in the generated .config"; exit 1; }
             grep -qE '^CONFIG_KSU_SUSFS=y' "$CFG" || { echo "::error::CONFIG_KSU_SUSFS is not =y in the generated .config - SUSFS would be a no-op"; exit 1; }
-            WANT=$(grep -cE '^CONFIG_KSU_SUSFS' "$GITHUB_WORKSPACE/.github/scripts/susfs.config")
+            WANT=$(grep -cE '^CONFIG_KSU_SUSFS' "$GITHUB_WORKSPACE/.github/scripts/susfs.config" | tr -dc '0-9')
             GOT=$(grep -cE '^CONFIG_KSU_SUSFS' "$CFG" | tr -dc '0-9')
-            echo "SUSFS options requested: $WANT   present in .config: ${GOT:-0}"
-            if [ "${GOT:-0}" -lt "$WANT" ]; then
+            echo "SUSFS options requested: ${WANT:-0}   present in .config: ${GOT:-0}"
+            if [ "${GOT:-0}" -lt "${WANT:-0}" ]; then
               echo "::warning::some SUSFS options did not land - compare the two lists above"
             fi
             echo "OK - KSU and SUSFS are both enabled in the generated .config"
@@ -348,7 +342,7 @@ jobs:
         run: |
           cd "$WORKDIR"
           set -o pipefail
-          # (the smoke-test step already applied these two fixes and disabled check_defconfig)
+          # (the smoke-test step already applied these two fixes and neutralised check_defconfig)
           rm -rf ./common/android/abi_gki_protected_exports_*
           sed -i "/stable_scmversion_cmd/s/-maybe-dirty//g" ./build/kernel/kleaf/impl/stamp.bzl
           tools/bazel build --config=fast --stamp //common:kernel_aarch64_dist
