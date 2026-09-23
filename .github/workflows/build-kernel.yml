@@ -587,6 +587,24 @@ jobs:
           fi
           echo "generated .config: ${CFG:-<not found>}"
           test -n "$CFG" || { echo "::error::no generated .config - cannot gate on config drift"; exit 1; }
+          # RUN #17 LESSON - a config line can be dropped by Kconfig without a word. The gate above
+          # reported exactly one remaining difference: CONFIG_MODULE_SCMVERSION is =y in the stock
+          # kernel but absent from ours, even though susfs.config sets it. Kconfig drops a symbol
+          # silently when its dependencies are unmet, so print the definition straight out of the
+          # pinned tree (the authoritative copy) and prove where our line ended up. This runs BEFORE
+          # the gate so both appear in the same log.
+          echo "--- why is CONFIG_MODULE_SCMVERSION not in our config? ---"
+          echo "[1] definition in the pinned tree:"
+          grep -rn -B3 -A20 '^config MODULE_SCMVERSION' common/ 2>/dev/null | head -40 || true
+          echo "[2] our fragment line:"
+          grep -n 'MODULE_SCMVERSION' "$RUNNER_TEMP/susfs.config" 2>/dev/null || true
+          echo "[3] did it reach gki_defconfig?"
+          grep -n 'MODULE_SCMVERSION' common/arch/arm64/configs/gki_defconfig 2>/dev/null || true
+          echo "[4] neighbours in the generated .config:"
+          grep -nE 'MODULE_SCMVERSION|MODULE_SIG|MODVERSIONS|LOCALVERSION' "$CFG" 2>/dev/null || true
+          echo "[5] every Kconfig predicate mentioning it:"
+          grep -rn 'MODULE_SCMVERSION' --include=Kconfig* common/ 2>/dev/null | head -10 || true
+
           python3 "$GITHUB_WORKSPACE/.github/scripts/kernel_config_diff.py" --config "$CFG"
 
       - name: kleaf build ${{ inputs.build_target }}
