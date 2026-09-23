@@ -82,7 +82,7 @@ jobs:
           swapon --show 2>/dev/null || true
           sudo swapoff -a >/dev/null 2>&1 || true
           sudo rm -f /swapfile /mnt/swapfile >/dev/null 2>&1 || true
-          sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192 status=none
+          sudo fallocate -l 16G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=16384 status=none
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile >/dev/null
           sudo swapon /swapfile
@@ -164,6 +164,29 @@ jobs:
         run: |
           cd "$WORKDIR"
           set -e
+
+          # RUN #16 LESSON - BUILD THE TREE THE STOCK KERNEL CAME FROM, NOT THE BRANCH TIP.
+          # The stock device reports 5.15.197-android13-8-00005-g2d8ad9139b89-ab15063902, and in a
+          # `git describe` string the trailing sha is HEAD - so Google built it from commit
+          # 2d8ad9139b89. Our `repo init -b <branch>` takes the branch TIP, and the config diff proved
+          # the two trees differ: CONFIG_ARM64_ERRATUM_4118414 is y in ours and absent from stock. A
+          # different source tree means different exported-symbol CRCs, so the vendor modules can
+          # refuse to load no matter how the build is configured. Pin it, and refuse to build if the
+          # commit cannot be resolved - a mismatched tree is worse than no build.
+          RELEASE_SHA=2d8ad9139b89
+          echo "============ pinning common/ to the stock release commit ============"
+          echo "target : $RELEASE_SHA  (from the stock release string)"
+          echo "before : $(git -C common rev-parse HEAD)  ($(git -C common rev-parse --abbrev-ref HEAD))"
+          if ! SHA=$(git -C common rev-parse --verify "${RELEASE_SHA}^{commit}" 2>/dev/null); then
+            echo "::error::cannot resolve $RELEASE_SHA in common/ - refusing to build an unmatched tree"
+            echo "hint: the release commit may predate the branch point we fetched"
+            exit 1
+          fi
+          echo "resolved: $SHA"
+          git -C common checkout --detach "$SHA"
+          echo "after  : $(git -C common rev-parse HEAD)"
+          echo "subject: $(git -C common log -1 --pretty=%s)"
+
           KV=$(awk '/^VERSION =/{a=$3} /^PATCHLEVEL =/{b=$3} /^SUBLEVEL =/{c=$3} END{print a"."b"."c}' common/Makefile)
           echo "source version: $KV"
           echo "device version: 5.15.197"
@@ -507,7 +530,7 @@ jobs:
           python3 "$GITHUB_WORKSPACE/.github/scripts/patch_setup_env.py" "$WORKDIR"
 
           echo "============ build the config target ============"
-          tools/bazel build //common:kernel_aarch64_config
+          tools/bazel build --lto=full //common:kernel_aarch64_config
 
           echo "============ did the options actually land? ============"
           CFG=$(find "$WORKDIR/out" -path '*/android13-5.15/common/.config' 2>/dev/null | head -1)
@@ -545,6 +568,27 @@ jobs:
           fi
 
       # ---------------------------------------------------------------- build
+      # ---------------------------------------------------------------- config drift gate
+      # RUN #16 LESSON: a kernel that compiles, packs and flashes can still be unbootable, because the
+      # vendor modules refuse to load when the config differs from the one they were built against. Run
+      # #16 differed in CONFIG_LTO_CLANG_FULL vs THIN, a missing CONFIG_MODULE_SCMVERSION, and a
+      # LOCALVERSION pin that masked the source tree not being the release commit.
+      # This gate diffs the generated .config against the stock config pulled off the device
+      # (.github/boot-template/stock-config.txt) and FAILS on anything except the KernelSU/SUSFS
+      # options we add deliberately. It runs here - before the expensive build - so drift costs ~15
+      # minutes to find rather than a flash and a bootloop.
+      - name: Config drift gate (must match the stock kernel)
+        run: |
+          cd "$WORKDIR"
+          set -e
+          CFG=$(find "$WORKDIR/out" -path '*/android13-5.15/common/.config' 2>/dev/null | head -1)
+          if [ -z "$CFG" ]; then
+            CFG=$(find "$WORKDIR/out" -name '.config' -path '*common*' 2>/dev/null | head -1)
+          fi
+          echo "generated .config: ${CFG:-<not found>}"
+          test -n "$CFG" || { echo "::error::no generated .config - cannot gate on config drift"; exit 1; }
+          python3 "$GITHUB_WORKSPACE/.github/scripts/kernel_config_diff.py" --config "$CFG"
+
       - name: kleaf build ${{ inputs.build_target }}
         timeout-minutes: 200
         run: |
@@ -622,7 +666,7 @@ jobs:
           # patches live. So the literal is stripped above instead (a one-line change to the pinned
           # kleaf that affects only the bogus suffix), the SCM part is pinned in common/.scmversion,
           # and the inspect step then verifies the result against the stock string exactly.
-          tools/bazel build --config=fast --stamp ${{ inputs.build_target }}
+          tools/bazel build --config=fast --lto=full --stamp ${{ inputs.build_target }}
           RC=$?
 
           kill "$WATCH_PID" 2>/dev/null || true
