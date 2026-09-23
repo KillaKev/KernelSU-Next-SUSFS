@@ -60,19 +60,38 @@ Two further facts that make this work:
 *(A custom manager signature hash for hiding can be added later — it needs a Kconfig change in
 KernelSU-Next, so it was deliberately left out rather than exposed as a knob that does nothing.)*
 
-Expect **~60–120 minutes**. The runner has ~70 GB on `/mnt` (which is why the build lives there —
-the default `/` has only ~14 GB and would run out).
+Expect **~60–120 minutes**.
+
+> **Run #1 failed in 1m44s with `No space left on device`** — and it took the *whole runner* down:
+> `System.IO.IOException: ... /home/runner/actions-runner/cached/.../_diag/Worker_....log`.
+> The runner's own logs live on `/`, and the stock `ubuntu-latest` image leaves `/` with very
+> little free — so the failure happened before the build even started.
+>
+> The workflow now (a) reclaims space with the standard removals, (b) **measures both mounts and
+> picks whichever has room** for `WORKDIR`, (c) **fails with an explicit error** if neither has
+> ~40 GB, and (d) only uploads the small flashable files (the full dist contains `vmlinux`, which
+> would blow both disk and artifact size).
 
 ### What it does, in order
-1. Workspace on `/mnt/kernel_workspace`
+1. Reclaim disk space, then **measure** `/` and `/mnt` and pick whichever has ≥40 GB for `WORKDIR`
 2. `repo init/sync` the ACK at `common-android13-5.15-2026-03`
 3. **Asserts** the source is exactly `5.15.197` (fails fast if not)
 4. Integrates KernelSU-Next via its own `kernel/setup.sh`
-5. Clones `susfs4ksu` → `gki-android13-5.15`, **dry-runs then applies** its kernel patch
-6. Appends `CONFIG_KSU*` / `CONFIG_KSU_SUSFS*` and the `CONFIG_LOCALVERSION` pin to `gki_defconfig`
-7. `tools/bazel build --config=fast --stamp //common:kernel_aarch64_dist`
-8. Lists the dist, prints any `kernelsu`/`susfs` and `5.15.197` markers, uploads the **whole dist**
-   plus `Image` / `Image.lz4` as an artifact
+5. **Applies SUSFS the documented three-part way** (this is what run #2 got wrong):
+   - copies `kernel_patches/fs/*` → `common/fs/` and `kernel_patches/include/linux/*` →
+     `common/include/linux/` — these provide `fs/susfs.c`, `susfs.h`, `susfs_def.h`
+   - applies the **KernelSU-side** patch `kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch`
+   - applies the **kernel-side** patch `…/*android13-5.15*.patch`
+6. **Repairs rejected hunks** — a rejected hunk is nearly always the `#include <linux/susfs.h>`
+   insertion at the top of a file, because the include blocks shifted between our KMI revision
+   (2026-03) and the one the SUSFS branch was cut from. The workflow prints every `.rej`, then
+   inserts the include deterministically
+7. Appends `CONFIG_KSU*` / `CONFIG_KSU_SUSFS*` and the `CONFIG_LOCALVERSION` pin to `gki_defconfig`
+8. `tools/bazel build --config=fast --stamp //common:kernel_aarch64_dist`
+9. Prints the dist listing and `kernelsu`/`susfs` markers, uploads `Image` / `Image.lz4` / `boot.img`
+
+> The SUSFS README is explicit that "if there are failed patches, you may try to patch them
+> manually by yourself" — so rejects are expected here, not a bug. Steps 5+6 make that automatic.
 
 ### Reading the result
 The artifact `kernel-Image-<run>` should contain `Image`, `Image.lz4`, and possibly a ready-made

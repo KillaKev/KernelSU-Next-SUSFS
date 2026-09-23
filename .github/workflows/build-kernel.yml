@@ -116,21 +116,92 @@ jobs:
           echo "--- drivers/Kconfig tail ---";  tail -3 drivers/Kconfig
 
       # ---------------------------------------------------------------- SUSFS
-      - name: Apply SUSFS (${{ inputs.susfs_branch }})
+      # RUN #2 LESSON: the OFFICIAL procedure (susfs4ksu README) is THREE parts, not one:
+      #   1. copy the SUSFS source files in (kernel_patches/fs/*, include/linux/*)
+      #   2. apply the KernelSU-side patch (10_enable_susfs_for_ksu.patch)
+      #   3. apply the kernel-side patch (50_add_susfs_in_gki-android13-5.15.patch)
+      # I only did part 3, so fs/susfs.c never existed for the hooks to call into.
+      # The README also says: "if there are failed patches, you may try to patch them
+      # manually by yourself" — our KMI revision (2026-03) is newer than the one the SUSFS
+      # branch was cut from, so a couple of include-block hunks reject. Tolerate + repair.
+      - name: Apply SUSFS (full 3-part procedure)
         run: |
           cd "$WORKDIR"
-          set -e
           git clone --depth=1 -b "${{ inputs.susfs_branch }}" \
             https://gitlab.com/simonpunk/susfs4ksu.git /tmp/susfs4ksu
-          echo "--- available kernel patches ---"
-          ls -la /tmp/susfs4ksu/kernel_patches/
-          P=$(ls /tmp/susfs4ksu/kernel_patches/*android13-5.15*.patch | head -1)
+          S=/tmp/susfs4ksu/kernel_patches
+          echo "--- patch tree ---"
+          find "$S" -maxdepth 2 -type f | sort
+
+          echo "--- (1) copying SUSFS source files ---"
+          cp -v "$S"/fs/*            "$WORKDIR/common/fs/"
+          cp -v "$S"/include/linux/* "$WORKDIR/common/include/linux/"
+
+          echo "--- (2) KernelSU-side patch ---"
+          KP="$S/KernelSU/10_enable_susfs_for_ksu.patch"
+          if [ -f "$KP" ]; then
+            cp -v "$KP" "$WORKDIR/common/KernelSU-Next/"
+            ( cd "$WORKDIR/common/KernelSU-Next" && patch -p1 --forward -F3 < "$KP" ) \
+              || echo "::warning::KernelSU-side patch had rejects (KernelSU-Next differs from upstream KernelSU)"
+          else
+            echo "!! no KernelSU-side patch at $KP"; ls -la "$S/KernelSU/" 2>/dev/null || true
+          fi
+
+          echo "--- (3) kernel-side patch ---"
+          P=$(ls "$S"/*android13-5.15*.patch | head -1)
           echo "applying: $P"
-          cd common
-          patch -p1 --dry-run < "$P"
-          patch -p1 < "$P"
-          echo "--- SUSFS files now present ---"
-          ls -la fs/susfs.c include/linux/susfs.h 2>/dev/null || true
+          ( cd "$WORKDIR/common" && patch -p1 --forward -F3 < "$P" ) \
+            || echo "::warning::kernel patch reported rejects - handled by the repair step"
+
+          echo "--- SUSFS files present? ---"
+          ls -la "$WORKDIR/common/fs/susfs.c" \
+                 "$WORKDIR/common/include/linux/susfs.h" \
+                 "$WORKDIR/common/include/linux/susfs_def.h" 2>/dev/null || true
+
+
+      # A rejected hunk is almost always the "#include <linux/susfs.h>" insertion near the top
+      # of a file: the include blocks shifted between our KMI revision and the SUSFS branch.
+      # That include is REQUIRED (the new hooks call into it), so put it back deterministically,
+      # and dump every .rej so the log proves exactly what was rejected.
+      - name: Repair rejected hunks (add missing susfs includes)
+        run: |
+          cd "$WORKDIR/common"
+          echo "=================== REJECTED HUNKS ==================="
+          REJ=$(find . -name '*.rej' | sort)
+          if [ -z "$REJ" ]; then echo "(none - the patch applied cleanly)"; fi
+          for r in $REJ; do
+            echo ""
+            echo "----- $r -----"
+            cat "$r"
+            f="${r%.rej}"
+            if [ -f "$f" ] && ! grep -q 'linux/susfs' "$f"; then
+              echo ">>> inserting #include <linux/susfs.h> into $f"
+              awk '
+                NR <= 120 && /^#include/ { last = NR }
+                { line[NR] = $0 }
+                END {
+                  for (i = 1; i <= NR; i++) {
+                    print line[i]
+                    if (last > 0 && i == last) {
+                      print "#ifdef CONFIG_KSU_SUSFS"
+                      print "#include <linux/susfs.h>"
+                      print "#endif"
+                    }
+                  }
+                }' "$f" > "$f.susfsfix"
+              mv "$f.susfsfix" "$f"
+            else
+              echo ">>> $f already references linux/susfs - leaving it alone"
+            fi
+            rm -f "$r"
+          done
+          echo ""
+          echo "=================== VERIFY ==================="
+          for f in fs/namespace.c fs/proc/task_mmu.c; do
+            if grep -q 'linux/susfs' "$f" 2>/dev/null; then echo "OK      $f has a susfs include"; else echo "MISSING $f"; fi
+          done
+          echo "--- any .rej still present? ---"
+          find . -name '*.rej' | head || true
 
       # ---------------------------------------------------------------- config
       - name: Enable KSU + SUSFS and pin the version string
