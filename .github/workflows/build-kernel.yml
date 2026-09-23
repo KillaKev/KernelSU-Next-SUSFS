@@ -20,9 +20,9 @@ on:
         required: true
         default: 'dev'
       susfs_branch:
-        description: 'susfs4ksu branch (5.15 = gki-android13-5.15)'
+        description: 'susfs4ksu branch - 5.15 options: gki-android13-5.15 (stable) / gki-android13-5.15-dev (latest)'
         required: true
-        default: 'gki-android13-5.15'
+        default: 'gki-android13-5.15-dev'
 
 
 jobs:
@@ -142,13 +142,35 @@ jobs:
           if [ -f "$KP" ]; then
             cp -v "$KP" "$WORKDIR/common/KernelSU-Next/"
             ( cd "$WORKDIR/common/KernelSU-Next" && patch -p1 --forward -F3 < "$KP" ) \
-              || echo "::warning::KernelSU-side patch had rejects (KernelSU-Next differs from upstream KernelSU)"
+              || echo "::warning::KernelSU-side patch had rejects - KernelSU-Next has diverged from upstream KernelSU"
           else
             echo "!! no KernelSU-side patch at $KP"; ls -la "$S/KernelSU/" 2>/dev/null || true
           fi
 
+          # DECISIVE CHECK. KernelSU-Next's own kernel/Kconfig declares only KSU, KSU_DEBUG,
+          # KSU_DISABLE_MANAGER, KSU_DISABLE_POLICY and KSU_X86_PATCH_SYSCALL_DISPATCHER - NO
+          # SUSFS, and its kernel/ tree has no susfs files. So if the KernelSU-side patch did not
+          # land, CONFIG_KSU_SUSFS will not exist, kconfig will silently DROP it from the
+          # defconfig, and we would spend ~2 hours building a kernel whose SUSFS hooks go nowhere.
+          echo "--- is SUSFS wired into KernelSU-Next's Kconfig? ---"
+          KSUSUSFS=$(grep -c 'KSU_SUSFS' "$WORKDIR/common/KernelSU-Next/kernel/Kconfig" 2>/dev/null | tr -dc '0-9')
+          echo "KSU_SUSFS occurrences in KernelSU-Next/kernel/Kconfig: ${KSUSUSFS:-0}"
+          if [ "${KSUSUSFS:-0}" -eq 0 ]; then
+            echo "=================== KERNELSU-NEXT REJECTS ==================="
+            find "$WORKDIR/common/KernelSU-Next" -name '*.rej' -print -exec cat {} \; 2>/dev/null || true
+            echo "::error::SUSFS is NOT wired into KernelSU-Next, so CONFIG_KSU_SUSFS would be dropped and SUSFS would be a silent no-op. Stopping before the 2-hour build."
+            exit 1
+          fi
+          echo "OK - KernelSU-Next now declares SUSFS options"
+
+
           echo "--- (3) kernel-side patch ---"
-          P=$(ls "$S"/*android13-5.15*.patch | head -1)
+          P=$(ls "$S"/*android13-5.15*.patch 2>/dev/null | head -1)
+          if [ -z "$P" ]; then
+            echo "::error::no *android13-5.15*.patch found on branch ${{ inputs.susfs_branch }}"
+            ls -la "$S"/ || true
+            exit 1
+          fi
           echo "applying: $P"
           ( cd "$WORKDIR/common" && patch -p1 --forward -F3 < "$P" ) \
             || echo "::warning::kernel patch reported rejects - handled by the repair step"

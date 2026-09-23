@@ -54,8 +54,20 @@ Two further facts that make this work:
 
 | Input | Default | Notes |
 |---|---|---|
-| `ksu_branch` | `dev` | KernelSU-Next branch/tag |
-| `susfs_branch` | `gki-android13-5.15` | verified to exist; `-dev` also available |
+| `ksu_branch` | `dev` | `dev` is KernelSU-Next's default branch (newest tag is `v3.4.0` if you prefer a release) |
+| `susfs_branch` | `gki-android13-5.15-dev` | both `gki-android13-5.15` (stable) and `-dev` (latest) are maintained — we chose **latest** |
+
+**A note on mixing refs.** The SUSFS README recommends pinning *tags* because its patches target
+specific KernelSU versions, and warns they "may differ for different kernel version or even on the
+same kernel version". We deliberately run both at their branch tips instead. To make that
+survivable rather than silent, the workflow now:
+
+- **fails immediately** if the KernelSU-side patch doesn't wire SUSFS in — verified by grepping
+  `KSU_SUSFS` in KernelSU-Next's own `kernel/Kconfig` (it declares only `KSU`, `KSU_DEBUG`,
+  `KSU_DISABLE_MANAGER`, `KSU_DISABLE_POLICY`, `KSU_X86_PATCH_SYSCALL_DISPATCHER` — **no SUSFS**).
+  Without the patch, kconfig silently drops `CONFIG_KSU_SUSFS` and you'd get a kernel whose SUSFS
+  hooks go nowhere
+- **fails** if no `*android13-5.15*.patch` exists on the chosen SUSFS branch
 
 *(A custom manager signature hash for hiding can be added later — it needs a Kconfig change in
 KernelSU-Next, so it was deliberately left out rather than exposed as a knob that does nothing.)*
