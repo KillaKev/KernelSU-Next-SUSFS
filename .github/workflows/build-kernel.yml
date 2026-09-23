@@ -428,7 +428,45 @@ jobs:
           # (the smoke-test step already applied these two fixes and neutralised check_defconfig)
           rm -rf ./common/android/abi_gki_protected_exports_*
           sed -i "/stable_scmversion_cmd/s/-maybe-dirty//g" ./build/kernel/kleaf/impl/stamp.bzl
+
+          # RUN #7 LESSON. This step ran ~31 min into compiling the kernel (251/258 actions) and was
+          # then killed by an EXTERNAL SIGTERM:
+          #     Bazel caught terminate signal; shutting down.
+          #     ##[error]The runner has received a shutdown signal ...
+          # That was NOT a build failure: bazel shut down cleanly, so the disk was not full (an
+          # ENOSPC would have been printed instead) and nothing was OOM-killed. The JOB was
+          # cancelled - the user can do that from the Actions UI, and GitHub also does it if the
+          # account's Actions minutes run out. That run had used 60 of its 240 allowed minutes.
+          # The real problem was that the log held NO disk or memory evidence to diagnose from, so
+          # sample both every 60 s and always print the tail.
+          WATCH="$RUNNER_TEMP/usage.log"
+          : > "$WATCH"
+          (
+            while true; do
+              {
+                echo "--- $(date -u +%Y-%m-%dT%H:%M:%SZ) free=$(df -BG --output=avail "$WORKDIR" 2>/dev/null | tail -1 | tr -dc '0-9')GB ---"
+                df -h "$WORKDIR" 2>/dev/null | tail -1
+                free -m 2>/dev/null | head -3
+              } >> "$WATCH" 2>&1
+              sleep 60
+            done
+          ) &
+          WATCH_PID=$!
+          trap 'kill "$WATCH_PID" 2>/dev/null || true' EXIT
+
           tools/bazel build --config=fast --stamp //common:kernel_aarch64_dist
+          RC=$?
+
+          kill "$WATCH_PID" 2>/dev/null || true
+          echo "============ FREE SPACE + RAM DURING THE BUILD (sampled every 60s) ============"
+          tail -60 "$WATCH" || true
+          echo "============ final state ============"
+          df -h "$WORKDIR" || true
+          free -m || true
+          if [ "$RC" -ne 0 ]; then
+            echo "::error::kleaf build exited $RC. An exit of 143 is SIGTERM, which means the JOB was cancelled rather than the build failing - check for a Cancel action in the Actions UI."
+          fi
+          exit "$RC"
 
       # ---------------------------------------------------------------- verify + upload
       - name: Inspect and collect all build outputs
