@@ -89,6 +89,7 @@ def cmd_extract_template(args):
             fh.write(blob[s_off:s_off + s_size])
 
     meta = dict(hdr,
+                header_sha256=sha256(blob[:PAGE]),
                 stock_kernel_size=k_size,
                 stock_kernel_sha256=sha256(blob[k_off:k_off + k_size]),
                 stock_file_size=len(blob),
@@ -116,6 +117,15 @@ def cmd_pack(args):
                          % (len(header), PAGE))
     with open(os.path.join(tmpl, "template.json")) as fh:
         meta = json.load(fh)
+
+    # The packer copies this header VERBATIM and then compares the result against it, so a template
+    # that was mangled in transit (line-ending or encoding damage) would compare equal to itself and
+    # pass silently. Pin it to the hash recorded when it was extracted from the device.
+    want = meta.get("header_sha256")
+    if want and sha256(bytes(header)) != want:
+        raise SystemExit("FATAL: boot-header.bin does not match template.json (header_sha256 %s vs %s) - "
+                         "the committed template was damaged, re-extract it from the stock boot.img"
+                         % (sha256(bytes(header)), want))
     with open(args.kernel, "rb") as fh:
         kernel = fh.read()
 
