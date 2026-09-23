@@ -92,15 +92,87 @@ Expect **~60–120 minutes**.
 5. **Applies SUSFS the documented three-part way** (this is what run #2 got wrong):
    - copies `kernel_patches/fs/*` → `common/fs/` and `kernel_patches/include/linux/*` →
      `common/include/linux/` — these provide `fs/susfs.c`, `susfs.h`, `susfs_def.h`
-   - applies the **KernelSU-side** patch `kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch`
+   - **does NOT** apply `kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch` — that patch is for
+     *upstream* KernelSU and rejects against KernelSU-Next; SUSFS ships inside the KernelSU-Next SUSFS
+     fork instead (see the run #7 note below). The step still asserts `KSU_SUSFS` is declared in
+     KernelSU-Next's `kernel/Kconfig`, but that is now true because of the fork, not a patch.
    - applies the **kernel-side** patch `…/*android13-5.15*.patch`
-6. **Repairs rejected hunks** — a rejected hunk is nearly always the `#include <linux/susfs.h>`
-   insertion at the top of a file, because the include blocks shifted between our KMI revision
-   (2026-03) and the one the SUSFS branch was cut from. The workflow prints every `.rej`, then
-   inserts the include deterministically
-7. Appends `CONFIG_KSU*` / `CONFIG_KSU_SUSFS*` and the `CONFIG_LOCALVERSION` pin to `gki_defconfig`
-8. `tools/bazel build --config=fast --stamp //common:kernel_aarch64_dist`
-9. Prints the dist listing and `kernelsu`/`susfs` markers, uploads `Image` / `Image.lz4` / `boot.img`
+6. **Re-applies every rejected hunk from its own content** (`.github/scripts/apply_rej.py`).
+   Run #3's only reject was `fs/namespace.c` around line 32, and that hunk carries
+   `#include <linux/susfs_def.h>`, two `extern`s and `#define CL_COPY_MNT_NS BIT(25)` — the applied
+   SUSFS code *uses* `CL_COPY_MNT_NS`, so dropping that hunk guarantees a compile failure. The step
+   now fails loudly if `CL_COPY_MNT_NS` is missing instead of discovering it two hours later.
+7. Appends the option list from `.github/scripts/susfs.config` to `gki_defconfig`, and if kleaf's
+   savedefconfig comparison rejects the result, adopts the canonical defconfig kleaf produced
+   (see the note below)
+8. **Config smoke test** — builds only `//common:kernel_aarch64_config` (~2 min, not ~2 h) and greps
+   the generated `.config` for `CONFIG_KSU=y` and `CONFIG_KSU_SUSFS=y`, failing fast if absent
+9. `tools/bazel build --config=fast --stamp //common:kernel_aarch64_dist`
+10. Prints the dist listing and `kernelsu`/`susfs` markers, uploads `Image` / `Image.lz4` / `boot.img`
+
+> **Runs #3–#6 all died at the config step on `ERROR: savedefconfig does not match …gki_defconfig`.**
+> The pinned toolchain is the key: the manifest's `<default revision="master-kernel-build-2022">`
+> means `build/kernel` (kleaf) is a **2022-era** revision, not `main`. Verified by downloading that
+> branch's kleaf archive and grepping all 131 files: `--defconfig_fragment` does not exist, and
+> **`check_defconfig` appears nowhere** — so there is no flag to pass and no attribute to flip.
+>
+> The guard is a bash **function** `check_defconfig` in `kernel/build`'s `_setup_env.sh` (which the
+> manifest links to `build/_setup_env.sh`), `export -f`-ed so the ACK's config step can call it:
+> ```bash
+> function check_defconfig() {
+>     (cd ${OUT_DIR} && make ${TOOL_ARGS} O=${OUT_DIR} savedefconfig)
+>     diff -u .../configs/${DEFCONFIG} ${OUT_DIR}/defconfig >&2 || RES=$?
+>     echo ERROR: savedefconfig does not match ... >&2
+>     return ${RES}
+> }
+> ```
+> It diffs the defconfig *file* against `make savedefconfig` output, which a hand-edited
+> `gki_defconfig` can never satisfy: KernelSU-Next declares `config KSU` as `tristate … default y`,
+> and `savedefconfig` never emits a value equal to its default — it drops `CONFIG_KSU=y` **even when
+> the option is in force** (which is why run #3's diff showed `-CONFIG_KSU=y`; that did *not* mean
+> KSU was off). `patch_setup_env.py` makes that function `return 0`, and the same step falls back to
+> `tools/bazel run //common:kernel_aarch64_config` (which writes the minimized defconfig back into
+> the tree) when the sandboxed `.config` isn't on disk.
+
+> **RUN #7 — the real reason runs #3–#6 could never have produced a working SUSFS kernel.**
+> `check_defconfig` was only the *first* wall. The second was architectural:
+> **upstream `KernelSU-Next/KernelSU-Next` ships no SUSFS at all** (its `kernel/Kconfig` declares only
+> `KSU`, `KSU_DEBUG`, `KSU_DISABLE_MANAGER`, `KSU_DISABLE_POLICY`, `KSU_X86_PATCH_SYSCALL_DISPATCHER`),
+> and simonpunk's `10_enable_susfs_for_ksu.patch` is written for **upstream KernelSU (tiann)**. Against
+> KernelSU-Next it rejects ~10 hunks — `kernel/Kbuild`, `kernel/core/init.c`, `kernel/feature/sucompat.c`,
+> `kernel/hook/setuid_hook.c`, `kernel/supercall/*`, `kernel/feature/kernel_umount.c`,
+> `kernel/supercall/dispatch.c` — and every one of those rejects is load-bearing.
+>
+> The kernel-side patch's `fs/exec.c` and `drivers/input/input.c` call these under `CONFIG_KSU_SUSFS=y`:
+> ```c
+> extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);
+> extern int ksu_handle_execveat_sucompat(int *fd, struct filename **, void *, void *, int *);
+> extern int ksu_handle_post_execveat_sucompat(int *fd, struct filename **, void *, void *, int *, int *);
+> extern __attribute__((cold)) int ksu_handle_input_handle_event(unsigned int *, unsigned int *, int *);
+> extern struct static_key_true ksu_is_input_hook_enabled;
+> ```
+> KernelSU-Next has none of them (its `ksu_handle_execveat_sucompat` even has the *old*
+> `(const char __user **, int, struct pt_regs *)` signature), so the run would have compiled for ~2 h
+> and then **failed at link**. Worse, the old step's "decisive check" only grepped for `KSU_SUSFS` in
+> the Kconfig — and the Kconfig hunk was one of the few that *did* apply, giving a **false green**.
+>
+> **The fix** is the one WildKernels use for their `next` flavor: build KernelSU-Next from the
+> **SUSFS fork**, `github.com/pershoot/KernelSU-Next` branch **`dev-susfs`**. Its own `kernel/setup.sh`
+> hardcodes `OWNER="pershoot"`, so only the `setup.sh` URL changed — the symlink + Kconfig/Makefile
+> wiring is unchanged. WildKernels state the rule plainly in `.github/actions/susfs`:
+> the enable patch is applied *only* when `root_flavor == 'kernelsu'`, because
+> *"pershoot dev-susfs (next) … already include SUSFS, so this is a no-op"*. They also resolve
+> `root_commit` from `https://github.com/pershoot/KernelSU-Next.git refs/heads/dev-susfs`, and their
+> matrix lists our exact target (`sublevel 197` / `date 2026-03` for `android13-5.15`).
+>
+> Verified locally against a real sparse clone of `dev-susfs` — every symbol above is defined with the
+> correct *new* signature (`feature/sucompat.c:289/277`, `runtime/ksud_integration.c:563/36`,
+> `policy/allowlist.c:287`, `feature/sucompat.c:53`, `core/init.c:106`), the new-signature variants sit
+> inside `#ifdef CONFIG_KSU_SUSFS`, and the 17 `susfs_*` helpers it calls that simonpunk's headers don't
+> declare are pershoot's *own* `selinux/selinux.c` symbols — so there is **no gap in either direction**.
+> `CONFIG_KSU_SUSFS_SUS_MAP=y` was added to `susfs.config` because `dev-susfs` references it.
+> Both directions of the API contract are now asserted in the workflow, so a future mismatch fails in
+> ~2 min instead of ~2 h.
 
 > The SUSFS README is explicit that "if there are failed patches, you may try to patch them
 > manually by yourself" — so rejects are expected here, not a bug. Steps 5+6 make that automatic.
