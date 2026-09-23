@@ -111,10 +111,15 @@ jobs:
       # of why their builds survive a runner ours died on:
       #     repo init --depth=1 ...  ;  repo sync -c --current-branch --no-clone-bundle -j4 --jobs-checkout=4
       # A plain `repo sync` clones the FULL history of every project - several GB of git objects we
-      # never read, on the one resource ubuntu-latest cannot give us more of. The build needs the tip
-      # only. (The vermagic that decides whether the 235 vendor modules load is gated on the symbol
-      # CRCs from the same KMI branch, not on git history, and CONFIG_LOCALVERSION is pinned in
-      # susfs.config, so a shallow clone is safe here.)
+      # never read, on the one resource ubuntu-latest cannot give us more of.
+      #
+      # Is a shallow clone safe for a kleaf build? Yes, and we have direct evidence rather than a
+      # guess: the previous sync already passed --no-tags, i.e. NO tags were fetched at all, and
+      # kleaf's stamp step (which runs `git describe` - see the stable_scmversion_cmd sed in the build
+      # step) still completed, because runs #7 and #8 both got ~30 min deep into the kernel compile
+      # under that arrangement. Depth imposes no constraint that --no-tags had not already imposed.
+      # CONFIG_LOCALVERSION is pinned in susfs.config, and the vermagic that decides whether the 235
+      # vendor modules load is gated on symbol CRCs from the same KMI branch, not on git history.
       - name: repo init + sync ACK android13-5.15-2026-03 (v5.15.197)
         run: |
           cd "$WORKDIR"
@@ -135,17 +140,18 @@ jobs:
           echo "device version: 5.15.197"
           test "$KV" = "5.15.197"
 
-          # RUN #8 LESSON: reclaim space we will never need again. `repo` keeps a second copy of the
-          # whole tree (and every project's objects) under .repo/ - several GB - and after the sync
-          # only the working tree matters. kleaf's scmversion stamping uses common/.git, NOT .repo,
-          # so deleting .repo is safe. Free disk is the one resource we cannot buy back on a
-          # ubuntu-latest runner, and the dist build is very hungry.
-          echo "============ reclaiming .repo metadata ============"
+          # RUN #9 LESSON - DO NOT DELETE .repo. It was added to reclaim space and it BROKE THE BUILD:
+          #     ERROR: common/BUILD.bazel:54:22: Building kernel kernel_aarch64 failed: (Exit 23)
+          #     symlink has no referent: ".../out__common_kernel_aarch64/android13-5.15/common/source/.git"
+          #     rsync error: some files/attrs were not transferred (code 23)
+          # In a repo-managed checkout each project's .git is only a POINTER into .repo/projects/...
+          # (alternates point at .repo/project-objects/...), so removing .repo leaves common/.git
+          # dangling and kleaf's rsync into the action sandbox fails within seconds. The space is won
+          # the right way instead: a shallow sync keeps .repo itself small, and the kernel-only build
+          # target skips the whole GKI module tree. Just record the sizes here.
+          echo "============ disk + .repo size (keep .repo - see comment) ============"
           df -h "$WORKDIR" | tail -1
           du -sh "$WORKDIR/.repo" 2>/dev/null || true
-          rm -rf "$WORKDIR/.repo"
-          echo "after removing .repo:"
-          df -h "$WORKDIR" | tail -1
 
       # ---------------------------------------------------------------- KernelSU-Next
       # RUN #7 FIX - WHY THIS NOW USES pershoot's FORK, NOT UPSTREAM KernelSU-Next.
