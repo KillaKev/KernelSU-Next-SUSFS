@@ -183,6 +183,26 @@ jobs:
           df -h "$WORKDIR" | tail -1
           du -sh "$WORKDIR/.repo" 2>/dev/null || true
 
+          # RUN #13 LESSON - PIN THE SCM VERSION IN THE FILE THE TOOLING RESPECTS.
+          # Two independent pieces of the pinned kleaf/ACK read this file instead of running git:
+          #   kleaf stamp rule - "Save scmversion to .scmversion if .scmversion does not already
+          #                      exist. If it does exist, then it is part of srcs, so respect its
+          #                      value."
+          #   scripts/setlocalversion - "if test -e .scmversion; then cat .scmversion; return"
+          # The stock device reports 5.15.197-android13-8-00005-g2d8ad9139b89-ab15063902, whose parts
+          # are: base 5.15.197 | scm -android13-8-00005-g2d8ad9139b89 | -ab15063902 (BUILD_NUMBER,
+          # appended by setlocalversion from the branch's build config). Pinning the middle part here
+          # makes the release deterministic and identical to stock even if git's describe would
+          # disagree. NOTE: no trailing newline - it would end up inside the version string.
+          # Keep EXPECT_REL identical to EXPECT in the inspect step.
+          EXPECT_REL=5.15.197-android13-8-00005-g2d8ad9139b89-ab15063902
+          SCM_PART=${EXPECT_REL#5.15.197}     # -android13-8-00005-g2d8ad9139b89-ab15063902
+          SCM_PART=${SCM_PART%-ab*}           # -android13-8-00005-g2d8ad9139b89
+          echo "common/.scmversion before: $(cat common/.scmversion 2>/dev/null || echo '<absent>')"
+          printf '%s' "$SCM_PART" > common/.scmversion
+          echo "common/.scmversion after:  $(cat common/.scmversion)"
+          echo "target release string:     $EXPECT_REL"
+
       # ---------------------------------------------------------------- KernelSU-Next
       # RUN #7 FIX - WHY THIS NOW USES pershoot's FORK, NOT UPSTREAM KernelSU-Next.
       #
@@ -436,16 +456,29 @@ jobs:
         run: |
           cd "$WORKDIR"
           rm -rf ./common/android/abi_gki_protected_exports_*
-          # RUN #12 LESSON - KILL THE "-maybe-dirty" SUFFIX FOR REAL (first of two places; see the
-          # build step for the full explanation). The old one-line sed only rewrote lines that
-          # themselves contained "stable_scmversion_cmd" in a single file, and it never matched.
-          echo "--- -maybe-dirty before strip (must name the offending file) ---"
+          # RUN #13 LESSON - KILL THE "-maybe-dirty" SUFFIX AT ITS SOURCE (first of two places).
+          # It is NOT a stray string: the pinned kleaf's own stamp rule contains
+          #     export LOCALVERSION="-maybe-dirty"
+          # (build/kernel/kleaf/impl/stamp.bzl, _set_localversion_cmd) and kleaf exports it whenever
+          # --config=stamp is absent, which is our case because --config=fast implies --config=local.
+          # kbuild appends LOCALVERSION to the end of KERNELRELEASE, which is exactly where the
+          # suffix appeared in run #12. Strip the literal so the export becomes LOCALVERSION="",
+          # print the line before and after as proof, and fail in seconds - not after a 50 minute
+          # build - if any occurrence survives.
+          echo "--- stamp.bzl LOCALVERSION before strip ---"
+          grep -rn 'LOCALVERSION=' ./build/kernel/kleaf/impl/stamp.bzl 2>/dev/null || true
           grep -rnI -- "-maybe-dirty" ./build ./common/scripts 2>/dev/null | head -20 || true
           grep -rlI -- "-maybe-dirty" ./build ./common/scripts 2>/dev/null | while read -r f; do
             sed -i 's/-maybe-dirty//g' "$f"
           done
-          echo "--- -maybe-dirty after strip (must be empty) ---"
-          grep -rnI -- "-maybe-dirty" ./build ./common/scripts 2>/dev/null | head -20 || true
+          echo "--- stamp.bzl LOCALVERSION after strip ---"
+          grep -rn 'LOCALVERSION=' ./build/kernel/kleaf/impl/stamp.bzl 2>/dev/null || true
+          if grep -rqI -- "-maybe-dirty" ./build ./common/scripts 2>/dev/null; then
+            echo "::error::-maybe-dirty survives under build/ or common/scripts - the release string would not match stock"
+            grep -rnI -- "-maybe-dirty" ./build ./common/scripts 2>/dev/null | head -20
+            exit 1
+          fi
+          echo "OK   no -maybe-dirty left under build/ or common/scripts"
 
           echo "============ append the options to gki_defconfig ============"
           DEF=./common/arch/arm64/configs/gki_defconfig
@@ -513,26 +546,31 @@ jobs:
           set -o pipefail
           # (the smoke-test step already applied these two fixes and neutralised check_defconfig)
           rm -rf ./common/android/abi_gki_protected_exports_*
-          # RUN #12 LESSON - KILL THE "-maybe-dirty" SUFFIX FOR REAL.
-          # The built Image reported
+          # RUN #13 LESSON - KILL THE "-maybe-dirty" SUFFIX AT ITS SOURCE (second of two places).
+          # Run #12's Image said
           #     5.15.197-android13-8-00005-g2d8ad9139b89-ab15063902-maybe-dirty
-          # while the stock device reports (nothing_stock_baseline/boot_state.txt)
+          # while the stock device says (nothing_stock_baseline/boot_state.txt)
           #     5.15.197-android13-8-00005-g2d8ad9139b89-ab15063902
-          # The ACK revision (g2d8ad9139b89) and the build id (ab15063902) match EXACTLY, so
-          # "-maybe-dirty" is the only difference - and it lands in UTS_RELEASE, therefore in the
-          # vermagic that the device's 235 vendor modules (and Nothing's Wallet/Fenrir attestation)
-          # compare against. With it present they all reject the kernel. The old one-line sed only
-          # rewrote lines that themselves contained "stable_scmversion_cmd" in a single file, which
-          # evidently never matched, so the strip now covers both trees that can produce the version
-          # string. The inspect step below FAILS the run if the suffix survives, so a kernel that
-          # cannot load its modules can never be uploaded silently.
-          echo "--- -maybe-dirty before strip (must name the offending file) ---"
+          # The ACK revision (g2d8ad9139b89) and build id (ab15063902) already match EXACTLY, so the
+          # suffix is the only difference - and it sits in UTS_RELEASE, hence in the vermagic that the
+          # 235 vendor modules and Nothing's Wallet/Fenrir attestation compare against. It comes from
+          # kleaf's own stamp rule (export LOCALVERSION="-maybe-dirty", used whenever --config=stamp is
+          # absent), so stripping the literal turns that export into LOCALVERSION="" and nothing else
+          # changes. Verify in seconds, not after the build.
+          echo "--- stamp.bzl LOCALVERSION before strip ---"
+          grep -rn 'LOCALVERSION=' ./build/kernel/kleaf/impl/stamp.bzl 2>/dev/null || true
           grep -rnI -- "-maybe-dirty" ./build ./common/scripts 2>/dev/null | head -20 || true
           grep -rlI -- "-maybe-dirty" ./build ./common/scripts 2>/dev/null | while read -r f; do
             sed -i 's/-maybe-dirty//g' "$f"
           done
-          echo "--- -maybe-dirty after strip (must be empty) ---"
-          grep -rnI -- "-maybe-dirty" ./build ./common/scripts 2>/dev/null | head -20 || true
+          echo "--- stamp.bzl LOCALVERSION after strip ---"
+          grep -rn 'LOCALVERSION=' ./build/kernel/kleaf/impl/stamp.bzl 2>/dev/null || true
+          if grep -rqI -- "-maybe-dirty" ./build ./common/scripts 2>/dev/null; then
+            echo "::error::-maybe-dirty survives under build/ or common/scripts - the release string would not match stock"
+            grep -rnI -- "-maybe-dirty" ./build ./common/scripts 2>/dev/null | head -20
+            exit 1
+          fi
+          echo "OK   no -maybe-dirty left under build/ or common/scripts"
 
           # RUN #7/#8 LESSON. This step got 30+ min into the kernel compile and was then killed by
           # an ORDERLY SIGTERM - with no compile error, no ENOSPC and no OOM anywhere in the log:
@@ -566,6 +604,12 @@ jobs:
           WATCH_PID=$!
           trap 'kill "$WATCH_PID" 2>/dev/null || true' EXIT
 
+          # NOTE ON --config=stamp: kleaf's own switch of that name is the "official" way to stop it
+          # exporting LOCALVERSION="-maybe-dirty", but it cannot be combined with --config=local, and
+          # --config=fast implies local - which is also what keeps this build in-tree where the SUSFS
+          # patches live. So the literal is stripped above instead (a one-line change to the pinned
+          # kleaf that affects only the bogus suffix), the SCM part is pinned in common/.scmversion,
+          # and the inspect step then verifies the result against the stock string exactly.
           tools/bazel build --config=fast --stamp ${{ inputs.build_target }}
           RC=$?
 
@@ -619,6 +663,12 @@ jobs:
           # #12 built "...-ab15063902-maybe-dirty", which no stock module would accept, so the suffix
           # is stripped before the build and its survival is a hard failure here - a kernel that
           # cannot load its modules must never be uploaded.
+          # Show the machinery that produced it, so any mismatch is diagnosable from this log alone.
+          echo "--- version machinery (evidence) ---"
+          echo "common/.scmversion: $(cat ./common/.scmversion 2>/dev/null || echo '<absent>')"
+          find out -name 'kernel.release' -o -name 'localversion' 2>/dev/null | sort | head -10 | \
+            while read -r f; do echo "  $f => $(head -1 "$f" 2>/dev/null)"; done || true
+
           EXPECT="5.15.197-android13-8-00005-g2d8ad9139b89-ab15063902"
           if strings -a bazel-bin/common/kernel_aarch64/Image | grep -qxF "$EXPECT"; then
             echo "OK   release string reproduces the stock kernel exactly: $EXPECT"
