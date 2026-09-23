@@ -686,14 +686,15 @@ jobs:
           WATCH_PID=$!
           trap 'kill "$WATCH_PID" 2>/dev/null || true' EXIT
 
-          # RUN #18 LESSON - the flags are now settled by evidence, not by my earlier guess that
-          # --config=stamp cannot coexist with --config=local. --config=stamp is required: it keeps
-          # CONFIG_LOCALVERSION_AUTO enabled (which CONFIG_MODULE_SCMVERSION depends on) and makes kleaf
-          # resolve the version from common/.scmversion - which step 6 pins to the exact stock string -
-          # instead of exporting the "-maybe-dirty" placeholder. The literal is still stripped above as
-          # belt and braces, and --lto=full matches the stock kernel's CONFIG_LTO_CLANG_FULL.
-          # If bazel rejects this combination the smoke test above fails fast and says so.
-          tools/bazel build --config=fast --config=stamp --lto=full --stamp ${{ inputs.build_target }}
+          # RUN #19 LESSON - --config=fast MUST NOT be combined with --config=stamp, and kleaf says so
+          # in as many words:
+          #     fail("--config=local cannot be set with --config=stamp. SCM version cannot be embedded
+          #           without sandboxing. See build/kernel/kleaf/sandbox.md.")
+          # --config=fast implies --config=local, hence the conflict. The config smoke test above
+          # already proved --config=stamp --lto=full works, so the build now uses exactly those flags.
+          # Sandboxing does not stop our SUSFS patches being used: they are workspace sources, not
+          # local-build shortcuts. Full LTO needs the 16 GB swap added in step 2.
+          tools/bazel build --config=stamp --lto=full ${{ inputs.build_target }}
           RC=$?
 
           kill "$WATCH_PID" 2>/dev/null || true
