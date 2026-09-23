@@ -23,6 +23,10 @@ on:
         description: 'susfs4ksu branch - 5.15 options: gki-android13-5.15 (stable) / gki-android13-5.15-dev (latest)'
         required: true
         default: 'gki-android13-5.15-dev'
+      build_target:
+        description: 'Bazel target to build. //common:kernel_aarch64_dist builds the kernel PLUS every GKI module and the whole dist dir (tens of GB, the long pole). //common:kernel_aarch64 builds just the kernel Image + Image.lz4 - which is all boot.img needs, since the 235 vendor modules are prebuilt on-device and load by KMI.'
+        required: true
+        default: '//common:kernel_aarch64'
 
 
 jobs:
@@ -106,6 +110,18 @@ jobs:
           echo "source version: $KV"
           echo "device version: 5.15.197"
           test "$KV" = "5.15.197"
+
+          # RUN #8 LESSON: reclaim space we will never need again. `repo` keeps a second copy of the
+          # whole tree (and every project's objects) under .repo/ - several GB - and after the sync
+          # only the working tree matters. kleaf's scmversion stamping uses common/.git, NOT .repo,
+          # so deleting .repo is safe. Free disk is the one resource we cannot buy back on a
+          # ubuntu-latest runner, and the dist build is very hungry.
+          echo "============ reclaiming .repo metadata ============"
+          df -h "$WORKDIR" | tail -1
+          du -sh "$WORKDIR/.repo" 2>/dev/null || true
+          rm -rf "$WORKDIR/.repo"
+          echo "after removing .repo:"
+          df -h "$WORKDIR" | tail -1
 
       # ---------------------------------------------------------------- KernelSU-Next
       # RUN #7 FIX - WHY THIS NOW USES pershoot's FORK, NOT UPSTREAM KernelSU-Next.
@@ -421,7 +437,7 @@ jobs:
           fi
 
       # ---------------------------------------------------------------- build
-      - name: kleaf build //common:kernel_aarch64_dist
+      - name: kleaf build ${{ inputs.build_target }}
         timeout-minutes: 200
         run: |
           cd "$WORKDIR"
@@ -457,7 +473,7 @@ jobs:
           WATCH_PID=$!
           trap 'kill "$WATCH_PID" 2>/dev/null || true' EXIT
 
-          tools/bazel build --config=fast --stamp //common:kernel_aarch64_dist
+          tools/bazel build --config=fast --stamp ${{ inputs.build_target }}
           RC=$?
 
           kill "$WATCH_PID" 2>/dev/null || true
