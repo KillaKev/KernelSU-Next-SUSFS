@@ -46,13 +46,26 @@ jobs:
           echo "================= BEFORE ================="
           df -h / /mnt 2>/dev/null || df -h
 
-          # standard, transparent space reclaim (no third-party action)
+          # Aggressive, transparent space reclaim (no third-party action). This mirrors the list
+          # WildKernels get from endersonmenezes/free-disk-space@v4 - on an ubuntu-latest runner
+          # DISK is the resource that runs out, and the kernel build is very hungry.
+          # /opt/hostedtoolcache is listed explicitly as well as via $AGENT_TOOLSDIRECTORY, because
+          # relying on the variable alone does nothing at all if it happens to be unset.
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      /opt/hostedtoolcache /usr/local/share/boost \
                       /usr/share/swift /usr/lib/jvm /usr/local/lib/node_modules \
                       /opt/az /usr/share/miniconda /usr/local/.ghcup \
-                      /usr/lib/google-cloud-sdk "$AGENT_TOOLSDIRECTORY" 2>/dev/null || true
+                      /usr/lib/google-cloud-sdk /usr/local/share/chromium \
+                      /usr/local/share/powershell /usr/local/julia /usr/local/aws-cli \
+                      /usr/local/aws-sam-cli /usr/share/gradle /usr/lib/mono \
+                      /usr/share/java /opt/microsoft /usr/local/graalvm \
+                      "$AGENT_TOOLSDIRECTORY" 2>/dev/null || true
           sudo docker image prune -af >/dev/null 2>&1 || true
+          # WildKernels also run free-disk-space with remove_swap: true, so removing the stock swap
+          # here matches them (it frees a few GB). They later ADD 16 GB back for LTO=thin; we do
+          # not, because --config=fast means LTO=none, so memory pressure is far lower and a 16 GB
+          # swapfile would simply eat the disk we are trying to save. If the watchdog ever shows
+          # memory (not disk) collapsing, adding one is the next move.
           sudo swapoff -a >/dev/null 2>&1 || true
           sudo rm -f /swapfile /mnt/swapfile >/dev/null 2>&1 || true
           sudo apt-get clean >/dev/null 2>&1 || true
@@ -94,12 +107,23 @@ jobs:
           git config --global color.ui false
 
       # ---------------------------------------------------------------- sync
+      # WildKernels' download-kernel action is deliberately SHALLOW and lean, and that is a large part
+      # of why their builds survive a runner ours died on:
+      #     repo init --depth=1 ...  ;  repo sync -c --current-branch --no-clone-bundle -j4 --jobs-checkout=4
+      # A plain `repo sync` clones the FULL history of every project - several GB of git objects we
+      # never read, on the one resource ubuntu-latest cannot give us more of. The build needs the tip
+      # only. (The vermagic that decides whether the 235 vendor modules load is gated on the symbol
+      # CRCs from the same KMI branch, not on git history, and CONFIG_LOCALVERSION is pinned in
+      # susfs.config, so a shallow clone is safe here.)
       - name: repo init + sync ACK android13-5.15-2026-03 (v5.15.197)
         run: |
           cd "$WORKDIR"
+          set -e
+          echo "disk before sync:"; df -h "$WORKDIR" | tail -1
           repo init -u https://android.googlesource.com/kernel/manifest \
-                    -b common-android13-5.15-2026-03
-          repo sync -j8 --no-tags --current-branch
+                    -b common-android13-5.15-2026-03 --depth=1
+          repo sync -c --current-branch --no-clone-bundle --depth=1 -j4 --jobs-checkout=4
+          echo "disk after sync:"; df -h "$WORKDIR" | tail -1
           du -sh "$WORKDIR"
 
       - name: Verify source kernel version is exactly 5.15.197
@@ -498,6 +522,20 @@ jobs:
                    bazel-bin/common/kernel_aarch64/Image.lz4; do
             if [ -f "$f" ]; then echo "OK   $f ($(stat -c%s "$f") bytes)"; else echo "MISS $f"; fi
           done
+          # The lean //common:kernel_aarch64 target may not emit Image.lz4 the way the _dist target
+          # does, and GKI boot images carry an lz4-compressed kernel. Make one if it is missing, so a
+          # successful build always ships something flashable.
+          if [ ! -f bazel-bin/common/kernel_aarch64/Image.lz4 ] && [ -f bazel-bin/common/kernel_aarch64/Image ]; then
+            echo "--- Image.lz4 missing - compressing Image ourselves ---"
+            command -v lz4 >/dev/null 2>&1 || sudo apt-get install -y -qq lz4 >/dev/null 2>&1 || true
+            if command -v lz4 >/dev/null 2>&1; then
+              lz4 -l -12 --favor-decSpeed bazel-bin/common/kernel_aarch64/Image \
+                  bazel-bin/common/kernel_aarch64/Image.lz4 \
+                && echo "OK   created Image.lz4 ($(stat -c%s bazel-bin/common/kernel_aarch64/Image.lz4) bytes)"
+            else
+              echo "::warning::lz4 is unavailable - shipping the uncompressed Image only (the boot image can be repacked from it)"
+            fi
+          fi
           echo "--- KSU/SUSFS markers in the built kernel ---"
           strings -a bazel-bin/common/kernel_aarch64/Image | grep -m10 -iE 'kernelsu|susfs' || \
             echo "(none found - KSU may be built as a loadable module)"
