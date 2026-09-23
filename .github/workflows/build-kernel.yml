@@ -76,6 +76,9 @@ jobs:
           df -h "$WD"
 
 
+      # check out this repo so the helper scripts under .github/scripts are available
+      - uses: actions/checkout@v4
+
       - name: Install repo tool
         run: |
           mkdir -p "$HOME/bin"
@@ -181,86 +184,144 @@ jobs:
                  "$WORKDIR/common/include/linux/susfs_def.h" 2>/dev/null || true
 
 
-      # A rejected hunk is almost always the "#include <linux/susfs.h>" insertion near the top
-      # of a file: the include blocks shifted between our KMI revision and the SUSFS branch.
-      # That include is REQUIRED (the new hooks call into it), so put it back deterministically,
-      # and dump every .rej so the log proves exactly what was rejected.
-      - name: Repair rejected hunks (add missing susfs includes)
+      # RUN #3 LESSON: the previous awk heuristic inserted a GUESSED '#include <linux/susfs.h>'
+      # and deleted the .rej, throwing away `#include <linux/susfs_def.h>`, the two externs and
+      # `#define CL_COPY_MNT_NS BIT(25)` that the applied SUSFS code in fs/namespace.c actually
+      # uses (so it could never have compiled). apply_rej.py now re-applies each rejected hunk
+      # from its OWN added lines, anchoring on the last NON-BLANK context line - anchoring on the
+      # blank one matches the file's first empty line and would drop the code into the header.
+      - name: Repair rejected hunks (re-apply them from their own content)
         run: |
           cd "$WORKDIR/common"
-          echo "=================== REJECTED HUNKS ==================="
-          REJ=$(find . -name '*.rej' | sort)
-          if [ -z "$REJ" ]; then echo "(none - the patch applied cleanly)"; fi
-          for r in $REJ; do
-            echo ""
-            echo "----- $r -----"
-            cat "$r"
-            f="${r%.rej}"
-            if [ -f "$f" ] && ! grep -q 'linux/susfs' "$f"; then
-              echo ">>> inserting #include <linux/susfs.h> into $f"
-              awk '
-                NR <= 120 && /^#include/ { last = NR }
-                { line[NR] = $0 }
-                END {
-                  for (i = 1; i <= NR; i++) {
-                    print line[i]
-                    if (last > 0 && i == last) {
-                      print "#ifdef CONFIG_KSU_SUSFS"
-                      print "#include <linux/susfs.h>"
-                      print "#endif"
-                    }
-                  }
-                }' "$f" > "$f.susfsfix"
-              mv "$f.susfsfix" "$f"
-            else
-              echo ">>> $f already references linux/susfs - leaving it alone"
-            fi
-            rm -f "$r"
+          echo "=================== REJECTED HUNKS (before repair) ==================="
+          find . -name '*.rej' | sort || true
+          echo
+          echo "=================== RE-APPLYING THEM FROM THEIR OWN CONTENT ==================="
+          # RUN #3 LESSON: the previous awk heuristic inserted a guessed
+          # '#include <linux/susfs.h>' and DISCARDED the rest of the rejected hunk - losing
+          # '#include <linux/susfs_def.h>' plus the externs and
+          # '#define CL_COPY_MNT_NS BIT(25)' that the applied SUSFS code actually uses.
+          # apply_rej.py re-applies each rejected hunk using its own added lines, so nothing is
+          # guessed. Non-fatal here: some KernelSU-Next rejects are benign because
+          # KernelSU-Next already modernised that code.
+          python3 "$GITHUB_WORKSPACE/.github/scripts/apply_rej.py" "$WORKDIR/common" || true
+          echo
+          echo "=================== FATAL-IF-MISSING CHECKS ==================="
+          rc=0
+          for f in fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h; do
+            if [ -f "$f" ]; then echo "OK      $f"; else echo "MISSING $f"; rc=1; fi
           done
-          echo ""
-          echo "=================== VERIFY ==================="
-          for f in fs/namespace.c fs/proc/task_mmu.c; do
-            if grep -q 'linux/susfs' "$f" 2>/dev/null; then echo "OK      $f has a susfs include"; else echo "MISSING $f"; fi
-          done
-          echo "--- any .rej still present? ---"
-          find . -name '*.rej' | head || true
+          # the applied SUSFS code in fs/namespace.c references CL_COPY_MNT_NS; if the rejected
+          # hunk defining it was lost the build is guaranteed to fail, so stop before wasting it
+          if grep -q 'CL_COPY_MNT_NS' fs/namespace.c; then
+            echo "OK      fs/namespace.c has CL_COPY_MNT_NS"
+          else
+            echo "MISSING CL_COPY_MNT_NS in fs/namespace.c - the SUSFS hooks there cannot compile"
+            rc=1
+          fi
+          if grep -q 'linux/susfs' fs/proc/task_mmu.c; then
+            echo "OK      fs/proc/task_mmu.c references linux/susfs"
+          else
+            echo "MISSING susfs include in fs/proc/task_mmu.c"
+            rc=1
+          fi
+          echo "--- .rej remaining after repair ---"
+          find . -name '*.rej' | sort || true
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::SUSFS integration is incomplete - stopping before the build"
+            exit 1
+          fi
+          echo "SUSFS integration looks complete"
+
 
       # ---------------------------------------------------------------- config
-      - name: Enable KSU + SUSFS and pin the version string
+      # RUN #3 LESSON: kleaf's `check_defconfig` runs `make savedefconfig` and compares the result
+      # with kernel_build.defconfig, so ANY hand-edit of gki_defconfig fails with:
+      #   ERROR: savedefconfig does not match common/arch/arm64/configs/gki_defconfig
+      #   ERROR: common/BUILD.bazel:54:22: Creating kernel config kernel_aarch64_config failed
+      # The reason the diff looked so alarming is that KernelSU-Next declares
+      #     config KSU / tristate / depends on KPROBES && EXT4_FS / default y
+      # so savedefconfig OMITS CONFIG_KSU=y even when it is in force (ditto MODULE_SCMVERSION).
+      # `-CONFIG_KSU=y` in that diff did NOT mean KSU was off.
+      # Two routes are attempted, cheapest/most-supported first, and whichever works is used for
+      # the real build. Both are verified by grepping the GENERATED .config - which is the only
+      # thing that actually proves the options landed.
+      - name: Stage the KSU + SUSFS kernel config options
         run: |
           cd "$WORKDIR/common"
           set -e
-          DEF=arch/arm64/configs/gki_defconfig
-          cp "$DEF" "$DEF.bak"
-          cat >> "$DEF" <<'EOF'
+          # The canonical option list lives in this repo, so the fragment and the fallback
+          # cannot drift apart.
+          OPT="$GITHUB_WORKSPACE/.github/scripts/susfs.config"
+          test -f "$OPT"
+          cp -v "$OPT" susfs.fragment
+          cp -v "$OPT" "$RUNNER_TEMP/susfs.config"
+          echo "--- common/susfs.fragment ---"
+          cat susfs.fragment
+          echo "--- gki_defconfig untouched so far ---"
+          git status --short arch/arm64/configs/gki_defconfig || true
+          # sanity: the kernel-side patch must have produced the SUSFS source files
+          ls -la fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h
 
-          # ---- added by CI ----
-          CONFIG_KSU=y
-          CONFIG_KSU_SUSFS=y
-          CONFIG_KSU_SUSFS_SUS_PATH=y
-          CONFIG_KSU_SUSFS_SUS_MOUNT=y
-          CONFIG_KSU_SUSFS_SUS_KSTAT=y
-          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
-          CONFIG_KSU_SUSFS_ENABLE_LOG=y
-          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
-          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
-          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
-          CONFIG_LOCALVERSION="-android13-8-00005-g2d8ad9139b89-ab15063902"
-          # CONFIG_LOCALVERSION_AUTO is not set
-          EOF
-          # kconfig silently drops unknown symbols, so over-specifying here is safe
-          echo "--- appended options ---"
-          tail -14 "$DEF"
+      # ---------------------------------------------------------------- config smoke test
+      # The config target takes ~2 minutes; the full dist build takes ~2 hours. Never discover a
+      # config problem after the expensive part.
+      - name: kleaf config smoke test (fail in ~2 min, not ~2 h)
+        run: |
+          cd "$WORKDIR"
+          rm -rf ./common/android/abi_gki_protected_exports_*
+          sed -i "/stable_scmversion_cmd/s/-maybe-dirty//g" ./build/kernel/kleaf/impl/stamp.bzl
+
+          echo "============ attempt 1: fragment on the command line ============"
+          if tools/bazel build \
+               --defconfig_fragment=//common:susfs.fragment \
+               //common:kernel_aarch64_config; then
+            echo "OK - the config target accepted --defconfig_fragment"
+            echo "FRAG_FLAG=--defconfig_fragment=//common:susfs.fragment" >> "$GITHUB_ENV"
+          else
+            echo "::warning::fragment route failed - falling back to defconfig + check_defconfig=False"
+            echo "============ attempt 2: append to defconfig, check disabled ============"
+            cp ./common/arch/arm64/configs/gki_defconfig /tmp/gki_defconfig.orig
+            cat "$RUNNER_TEMP/susfs.config" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "--- defconfig tail ---"
+            tail -14 ./common/arch/arm64/configs/gki_defconfig
+            python3 "$GITHUB_WORKSPACE/.github/scripts/patch_build_bazel.py" "$WORKDIR/common"
+            echo "FRAG_FLAG=" >> "$GITHUB_ENV"
+            tools/bazel build //common:kernel_aarch64_config
+          fi
+
+          echo "============ did the options actually land in .config? ============"
+          CFG=$(find "$WORKDIR/out" -path '*/android13-5.15/common/.config' 2>/dev/null | head -1)
+          if [ -z "$CFG" ]; then
+            CFG=$(find "$WORKDIR/out" -name '.config' -path '*common*' 2>/dev/null | head -1)
+          fi
+          echo "generated .config: ${CFG:-<not found>}"
+          if [ -z "$CFG" ]; then
+            echo "::warning::could not find the generated .config - the post-build marker grep is the backstop"
+          else
+            echo "--- KSU lines ---"
+            grep -nE '^CONFIG_(KSU|KSU_SUSFS)|^# CONFIG_KSU' "$CFG" || echo "(no KSU lines at all)"
+            grep -qE '^CONFIG_KSU=y'       "$CFG" || { echo "::error::CONFIG_KSU is not =y in the generated .config"; exit 1; }
+            grep -qE '^CONFIG_KSU_SUSFS=y' "$CFG" || { echo "::error::CONFIG_KSU_SUSFS is not =y in the generated .config - SUSFS would be a no-op"; exit 1; }
+            WANT=$(grep -cE '^CONFIG_KSU_SUSFS' "$GITHUB_WORKSPACE/.github/scripts/susfs.config")
+            GOT=$(grep -cE '^CONFIG_KSU_SUSFS' "$CFG" | tr -dc '0-9')
+            echo "SUSFS options requested: $WANT   present in .config: ${GOT:-0}"
+            if [ "${GOT:-0}" -lt "$WANT" ]; then
+              echo "::warning::some SUSFS options did not land - compare the two lists above"
+            fi
+            echo "OK - KSU and SUSFS are both enabled in the generated .config"
+          fi
 
       # ---------------------------------------------------------------- build
       - name: kleaf build //common:kernel_aarch64_dist
         run: |
           cd "$WORKDIR"
           set -o pipefail
+          echo "using fragment flag: '${FRAG_FLAG:-<none>}'"
           # the same two fixes the earlier CI run applied
           rm -rf ./common/android/abi_gki_protected_exports_*
           sed -i "/stable_scmversion_cmd/s/-maybe-dirty//g" ./build/kernel/kleaf/impl/stamp.bzl
-          tools/bazel build --config=fast --stamp //common:kernel_aarch64_dist
+          tools/bazel build --config=fast --stamp ${FRAG_FLAG} //common:kernel_aarch64_dist
 
       # ---------------------------------------------------------------- verify + upload
       - name: Inspect and collect all build outputs
