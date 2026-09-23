@@ -16,9 +16,9 @@ on:
   workflow_dispatch:
     inputs:
       ksu_branch:
-        description: 'KernelSU-Next branch/tag to check out'
+        description: 'KernelSU-Next (SUSFS fork) branch/tag - MUST be a SUSFS-carrying branch such as dev-susfs; plain upstream dev has no SUSFS'
         required: true
-        default: 'dev'
+        default: 'dev-susfs'
       susfs_branch:
         description: 'susfs4ksu branch - 5.15 options: gki-android13-5.15 (stable) / gki-android13-5.15-dev (latest)'
         required: true
@@ -108,15 +108,74 @@ jobs:
           test "$KV" = "5.15.197"
 
       # ---------------------------------------------------------------- KernelSU-Next
-      - name: Integrate KernelSU-Next (${{ inputs.ksu_branch }})
+      # RUN #7 FIX - WHY THIS NOW USES pershoot's FORK, NOT UPSTREAM KernelSU-Next.
+      #
+      # Runs #3-#6 all got through this step and died at the config/link stage. The reason
+      # was NOT check_defconfig alone: upstream KernelSU-Next ships NO SUSFS, and
+      # simonpunk's kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch is written for
+      # UPSTREAM KernelSU (tiann). Against KernelSU-Next it rejects ~10 hunks and leaves
+      # these symbols UNDEFINED, while the kernel-side patch's fs/exec.c + input.c call them
+      # under CONFIG_KSU_SUSFS=y - i.e. a guaranteed link failure ~2 h in:
+      #     ksu_handle_execveat(int *fd, struct filename **, void*, void*, int*)
+      #     ksu_handle_post_execveat_sucompat(int *fd, ...)
+      #     ksu_handle_input_handle_event(unsigned int*, unsigned int*, int*)
+      #     ksu_is_input_hook_enabled, ksu_su_compat_enabled
+      #
+      # WildKernels - who build exactly our target (their config lists sublevel 197 /
+      # date 2026-03 for android13-5.15) - state it outright in .github/actions/susfs:
+      #   root_flavor 'kernelsu' -> apply 10_enable_susfs_for_ksu.patch
+      #   "other flavors already ship SUSFS" / "pershoot dev-susfs (next) ... no-op"
+      # and they resolve the KernelSU-Next root from
+      #   https://github.com/pershoot/KernelSU-Next.git refs/heads/dev-susfs
+      #
+      # VERIFIED LOCALLY (sparse clone of pershoot/KernelSU-Next dev-susfs): it defines
+      # every symbol above with the correct NEW signatures -
+      #   feature/sucompat.c:289  ksu_handle_execveat(int *fd, struct filename **, ...)
+      #   feature/sucompat.c:277  ksu_handle_post_execveat_sucompat(int *fd, ...)
+      #   runtime/ksud_integration.c:563  ksu_handle_input_handle_event(...)
+      #   runtime/ksud_integration.c:36   DEFINE_STATIC_KEY_TRUE(ksu_is_input_hook_enabled)
+      #   policy/allowlist.c:287  __ksu_is_allow_uid_for_current(uid_t)
+      #   feature/sucompat.c:53   DEFINE_STATIC_KEY_TRUE(ksu_su_compat_enabled)
+      #   core/init.c:106         susfs_init()
+      # The new-signature sucompat variants sit inside #ifdef CONFIG_KSU_SUSFS (the old
+      # (const char __user **, int, pt_regs*) ones are the #else branch), so enabling SUSFS
+      # selects them - no duplicate-definition collision.
+      # The 17 susfs_* helpers dev-susfs calls that simonpunk's headers do NOT declare are
+      # pershoot's OWN selinux/selinux.c symbols (susfs_set_sid, susfs_is_sid_equal, ...),
+      # so there is no gap in either direction.
+      #
+      # setup.sh from pershoot's fork already hardcodes OWNER="pershoot" and performs the
+      # drivers/kernelsu symlink + Kconfig/Makefile wiring itself, so this stays a one-line
+      # change to the source and NOTHING else about the integration mechanism changes.
+      - name: Integrate KernelSU-Next + SUSFS (${{ inputs.ksu_branch }})
         run: |
           cd "$WORKDIR/common"
           set -e
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/${{ inputs.ksu_branch }}/kernel/setup.sh" \
+          curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/${{ inputs.ksu_branch }}/kernel/setup.sh" \
             | bash -s "${{ inputs.ksu_branch }}"
           test -e drivers/kernelsu
           echo "--- drivers/Makefile tail ---"; tail -3 drivers/Makefile
           echo "--- drivers/Kconfig tail ---";  tail -3 drivers/Kconfig
+
+          echo "============ is this really a SUSFS-carrying KernelSU-Next? ============"
+          echo "KernelSU-Next HEAD: $(git -C "$WORKDIR/common/KernelSU-Next" rev-parse HEAD 2>/dev/null || echo unknown)"
+          echo "KernelSU-Next ref:  $(git -C "$WORKDIR/common/KernelSU-Next" describe --tags --always 2>/dev/null || echo unknown)"
+          KSUSUSFS=$(grep -c 'KSU_SUSFS' "$WORKDIR/common/KernelSU-Next/kernel/Kconfig" 2>/dev/null | tr -dc '0-9')
+          echo "KSU_SUSFS options declared in KernelSU-Next/kernel/Kconfig: ${KSUSUSFS:-0}"
+          if [ "${KSUSUSFS:-0}" -eq 0 ]; then
+            echo "::error::This KernelSU-Next checkout carries NO SUSFS. ksu_branch must be a SUSFS branch (dev-susfs). Upstream 'dev' has no SUSFS and the build would fail to link ~2 h in."
+            exit 1
+          fi
+          # the symbols the kernel-side patch links against must exist HERE, not later
+          for sym in ksu_handle_execveat ksu_handle_post_execveat_sucompat ksu_handle_input_handle_event ksu_is_input_hook_enabled susfs_init; do
+            if grep -rqE "\b${sym}\b" "$WORKDIR/common/KernelSU-Next/kernel" 2>/dev/null; then
+              echo "OK      KernelSU-Next defines/references ${sym}"
+            else
+              echo "::error::KernelSU-Next does not provide ${sym}, which the SUSFS kernel-side patch calls under CONFIG_KSU_SUSFS=y - the build WOULD fail at link."
+              exit 1
+            fi
+          done
+          echo "OK - KernelSU-Next carries SUSFS and exports the API the kernel patch needs"
 
       # ---------------------------------------------------------------- SUSFS
       # RUN #2 LESSON: the OFFICIAL procedure (susfs4ksu README) is THREE parts, not one:
@@ -140,31 +199,40 @@ jobs:
           cp -v "$S"/fs/*            "$WORKDIR/common/fs/"
           cp -v "$S"/include/linux/* "$WORKDIR/common/include/linux/"
 
-          echo "--- (2) KernelSU-side patch ---"
-          KP="$S/KernelSU/10_enable_susfs_for_ksu.patch"
-          if [ -f "$KP" ]; then
-            cp -v "$KP" "$WORKDIR/common/KernelSU-Next/"
-            ( cd "$WORKDIR/common/KernelSU-Next" && patch -p1 --forward -F3 < "$KP" ) \
-              || echo "::warning::KernelSU-side patch had rejects - KernelSU-Next has diverged from upstream KernelSU"
-          else
-            echo "!! no KernelSU-side patch at $KP"; ls -la "$S/KernelSU/" 2>/dev/null || true
+          # (2) KernelSU-side patch: NOT APPLIED ANY MORE - RUN #7 FIX.
+          #
+          # simonpunk's kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch exists to bolt
+          # SUSFS onto UPSTREAM KernelSU (tiann), which does not have it. Against
+          # KernelSU-Next it rejects ~10 hunks (kernel/Kbuild, kernel/core/init.c,
+          # kernel/feature/sucompat.c, kernel/hook/setuid_hook.c, kernel/supercall/*,
+          # kernel/feature/kernel_umount.c, kernel/supercall/dispatch.c) and every one of
+          # those rejects is load-bearing: the patch is what wires SUSFS into KernelSU's
+          # named hooks (ksu_handle_execveat, ksu_handle_input_handle_event, susfs_init...).
+          #
+          # We now use KernelSU-Next's SUSFS fork (pershoot/KernelSU-Next dev-susfs), where
+          # SUSFS is already integrated, so this patch must NOT be applied. WildKernels do
+          # the same: their susfs action applies it only for root_flavor == 'kernelsu' and
+          # notes "pershoot dev-susfs (next) ... already include SUSFS, so this is a no-op".
+          #
+          # The old code applied it, saw rejects, and then relied on a Kconfig grep to prove
+          # SUSFS was in - which passed because the Kconfig hunk was one of the few that DID
+          # apply. That false green is exactly what let runs #3-#6 get deep into the build.
+          echo "--- (2) KernelSU-side SUSFS patch: intentionally SKIPPED (already in the fork) ---"
+          if [ -f "$S/KernelSU/10_enable_susfs_for_ksu.patch" ]; then
+            echo "note: $S/KernelSU/10_enable_susfs_for_ksu.patch exists but targets upstream"
+            echo "      KernelSU (tiann); applying it here would only create rejects."
           fi
 
-          # DECISIVE CHECK. KernelSU-Next's own kernel/Kconfig declares only KSU, KSU_DEBUG,
-          # KSU_DISABLE_MANAGER, KSU_DISABLE_POLICY and KSU_X86_PATCH_SYSCALL_DISPATCHER - NO
-          # SUSFS, and its kernel/ tree has no susfs files. So if the KernelSU-side patch did not
-          # land, CONFIG_KSU_SUSFS will not exist, kconfig will silently DROP it from the
-          # defconfig, and we would spend ~2 hours building a kernel whose SUSFS hooks go nowhere.
+          # SUSFS must already be wired into this KernelSU-Next checkout. Re-assert it here
+          # because this step is where the false green happened before.
           echo "--- is SUSFS wired into KernelSU-Next's Kconfig? ---"
           KSUSUSFS=$(grep -c 'KSU_SUSFS' "$WORKDIR/common/KernelSU-Next/kernel/Kconfig" 2>/dev/null | tr -dc '0-9')
           echo "KSU_SUSFS occurrences in KernelSU-Next/kernel/Kconfig: ${KSUSUSFS:-0}"
           if [ "${KSUSUSFS:-0}" -eq 0 ]; then
-            echo "=================== KERNELSU-NEXT REJECTS ==================="
-            find "$WORKDIR/common/KernelSU-Next" -name '*.rej' -print -exec cat {} \; 2>/dev/null || true
             echo "::error::SUSFS is NOT wired into KernelSU-Next, so CONFIG_KSU_SUSFS would be dropped and SUSFS would be a silent no-op. Stopping before the 2-hour build."
             exit 1
           fi
-          echo "OK - KernelSU-Next now declares SUSFS options"
+          echo "OK - KernelSU-Next declares SUSFS options (from the fork, not from a patch)"
 
 
           echo "--- (3) kernel-side patch ---"
@@ -210,6 +278,21 @@ jobs:
           rc=0
           for f in fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h; do
             if [ -f "$f" ]; then echo "OK      $f"; else echo "MISSING $f"; rc=1; fi
+          done
+          # RUN #7 FIX: the other half of the API contract. KernelSU-Next (pershoot
+          # dev-susfs) CALLS into the kernel-side SUSFS - sucompat.c calls
+          # susfs_is_current_proc_no_su()/susfs_set_current_proc_no_su(), core/init.c calls
+          # susfs_init(), dispatch.c calls susfs_start_sdcard_monitor_fn(). Those live in
+          # fs/susfs.c and are declared in these headers. If the KernelSU-Next SUSFS API and
+          # the kernel-side SUSFS version disagree, the build dies at link ~2 h in - so
+          # check the entry points it actually uses right here, in ~2 min.
+          for sym in susfs_init susfs_is_current_proc_no_su susfs_set_current_proc_no_su susfs_start_sdcard_monitor_fn; do
+            if grep -qE "\b${sym}\b" include/linux/susfs.h include/linux/susfs_def.h 2>/dev/null; then
+              echo "OK      kernel-side SUSFS provides ${sym}"
+            else
+              echo "MISSING ${sym} in the kernel SUSFS headers - KernelSU-Next calls it, so the build WOULD fail at link"
+              rc=1
+            fi
           done
           # the applied SUSFS code in fs/namespace.c references CL_COPY_MNT_NS; if the rejected
           # hunk defining it was lost the build is guaranteed to fail, so stop before wasting it
