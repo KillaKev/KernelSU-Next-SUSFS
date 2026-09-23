@@ -280,27 +280,46 @@ jobs:
           sed -i "/stable_scmversion_cmd/s/-maybe-dirty//g" ./build/kernel/kleaf/impl/stamp.bzl
 
           echo "============ append the options to gki_defconfig ============"
-          cp ./common/arch/arm64/configs/gki_defconfig /tmp/gki_defconfig.orig
-          cat "$RUNNER_TEMP/susfs.config" >> ./common/arch/arm64/configs/gki_defconfig
+          DEF=./common/arch/arm64/configs/gki_defconfig
+          cp "$DEF" /tmp/gki_defconfig.orig
+          cat "$RUNNER_TEMP/susfs.config" >> "$DEF"
           echo "--- defconfig tail ---"
-          tail -14 ./common/arch/arm64/configs/gki_defconfig
+          tail -14 "$DEF"
 
-          echo "============ force kleaf's check_defconfig to disabled ============"
-          # RUN #4 LESSON: --defconfig_fragment does NOT exist in this kleaf vintage
-          # ("Unrecognized option: --defconfig_fragment"), and common/BUILD.bazel has no
-          # kernel_build() call to edit - it is `define_common_kernels(target_configs = {...})`.
-          # The guard we keep hitting lives in build/kernel/kleaf/common_kernels.bzl as:
-          #     check_defconfig = select({
-          #         Label("//build/kernel/kleaf:gki_build_config_fragment_is_unset"):
-          #             "match" if pre_defconfig_fragments else "minimized",
-          #         "//conditions:default": "disabled",
-          #     })
-          # i.e. a pure GKI build does the strict savedefconfig comparison. Force "disabled";
-          # the .config grep below is the check that actually matters.
-          python3 "$GITHUB_WORKSPACE/.github/scripts/disable_check_defconfig.py" "$WORKDIR"
-
-          echo "============ build the config target ============"
-          tools/bazel build //common:kernel_aarch64_config
+          echo "============ attempt 1: build the config target ============"
+          if tools/bazel build //common:kernel_aarch64_config; then
+            echo "OK - the config target accepted the edited defconfig"
+          else
+            # RUN #5 LESSON: the pinned kleaf is `master-kernel-build-2022` (from the manifest's
+            # <default revision=...>; build/kernel has no explicit revision). In that vintage:
+            #   * --defconfig_fragment does not exist ("Unrecognized option")
+            #   * `check_defconfig` appears NOWHERE in kleaf/ (verified against the real archive),
+            #     so there is no attribute to flip
+            #   * the guard is a plain textual comparison of `make savedefconfig` output against
+            #     the defconfig FILE - and it writes the defconfig it expects (run #3's diff
+            #     header showed its path).
+            # So instead of fighting it: adopt that file. The comparison then passes by
+            # construction. Our options survive because savedefconfig emits every non-default
+            # value, and anything sitting at its default (CONFIG_KSU is `default y`) stays
+            # enabled regardless - which the .config grep below proves.
+            echo "::warning::config target rejected the edited defconfig - adopting kleaf's own canonical defconfig"
+            GEN=$(find "$WORKDIR/out" -path '*android13-5.15/common/defconfig' 2>/dev/null | head -1)
+            echo "kleaf's generated defconfig: ${GEN:-<not found>}"
+            if [ -n "$GEN" ]; then
+              echo "--- what kleaf expects (first 25 lines) ---"
+              head -25 "$GEN"
+              echo "--- KSU lines in it (absent is fine only if the symbol defaults to y) ---"
+              grep -nE '^CONFIG_(KSU|KSU_SUSFS)' "$GEN" || echo "(none)"
+              cp "$GEN" "$DEF"
+              echo "--- defconfig adopted; retrying the config target ---"
+              tools/bazel build //common:kernel_aarch64_config
+            else
+              echo "::error::could not find kleaf's generated defconfig to adopt"
+              echo "--- for next time: where does the check come from? ---"
+              grep -rl 'savedefconfig' "$WORKDIR/build" "$WORKDIR/common/Makefile" 2>/dev/null | head -10 || true
+              exit 1
+            fi
+          fi
 
           echo "============ did the options actually land in .config? ============"
           CFG=$(find "$WORKDIR/out" -path '*/android13-5.15/common/.config' 2>/dev/null | head -1)
