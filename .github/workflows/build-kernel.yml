@@ -422,6 +422,7 @@ jobs:
 
       # ---------------------------------------------------------------- build
       - name: kleaf build //common:kernel_aarch64_dist
+        timeout-minutes: 200
         run: |
           cd "$WORKDIR"
           set -o pipefail
@@ -429,25 +430,27 @@ jobs:
           rm -rf ./common/android/abi_gki_protected_exports_*
           sed -i "/stable_scmversion_cmd/s/-maybe-dirty//g" ./build/kernel/kleaf/impl/stamp.bzl
 
-          # RUN #7 LESSON. This step ran ~31 min into compiling the kernel (251/258 actions) and was
-          # then killed by an EXTERNAL SIGTERM:
+          # RUN #7/#8 LESSON. This step got 30+ min into the kernel compile and was then killed by
+          # an ORDERLY SIGTERM - with no compile error, no ENOSPC and no OOM anywhere in the log:
           #     Bazel caught terminate signal; shutting down.
           #     ##[error]The runner has received a shutdown signal ...
-          # That was NOT a build failure: bazel shut down cleanly, so the disk was not full (an
-          # ENOSPC would have been printed instead) and nothing was OOM-killed. The JOB was
-          # cancelled - the user can do that from the Actions UI, and GitHub also does it if the
-          # account's Actions minutes run out. That run had used 60 of its 240 allowed minutes.
-          # The real problem was that the log held NO disk or memory evidence to diagnose from, so
-          # sample both every 60 s and always print the tail.
-          WATCH="$RUNNER_TEMP/usage.log"
-          : > "$WATCH"
+          #     ##[error]The operation was canceled.
+          # That is a CANCEL, not a build failure. The workflow allows 240 min and had used ~58;
+          # there is no concurrency group; GitHub reported no incident at the time. That leaves the
+          # account's Actions minutes/spending limit - this repository is PRIVATE, so its minutes
+          # are billed and GitHub cancels RUNNING jobs the moment the budget runs out.
+          # .github/workflows/canary.yml answers that question in seconds instead of an hour.
+          #
+          # The previous watchdog wrote to a file and printed it after bazel returned - so the
+          # SIGTERM killed the shell first and it never printed anything. This one streams straight
+          # to STDOUT, so every sample is already in the log when the kill lands.
+          echo "============ build starting $(date -u +%H:%M:%SZ); sampling disk + RAM every 60s ============"
           (
             while true; do
-              {
-                echo "--- $(date -u +%Y-%m-%dT%H:%M:%SZ) free=$(df -BG --output=avail "$WORKDIR" 2>/dev/null | tail -1 | tr -dc '0-9')GB ---"
-                df -h "$WORKDIR" 2>/dev/null | tail -1
-                free -m 2>/dev/null | head -3
-              } >> "$WATCH" 2>&1
+              printf '%s free=%sGB  ' "$(date -u +%H:%M:%SZ)" \
+                "$(df -BG --output=avail "$WORKDIR" 2>/dev/null | tail -1 | tr -dc '0-9')"
+              free -m 2>/dev/null | awk '/^Mem:/{printf "mem_used=%sMB mem_avail=%sMB ", $3, $7}'
+              free -m 2>/dev/null | awk '/^Swap:/{printf "swap_used=%sMB\n", $3}'
               sleep 60
             done
           ) &
@@ -458,13 +461,11 @@ jobs:
           RC=$?
 
           kill "$WATCH_PID" 2>/dev/null || true
-          echo "============ FREE SPACE + RAM DURING THE BUILD (sampled every 60s) ============"
-          tail -60 "$WATCH" || true
-          echo "============ final state ============"
+          echo "============ final state (build exit $RC) ============"
           df -h "$WORKDIR" || true
           free -m || true
           if [ "$RC" -ne 0 ]; then
-            echo "::error::kleaf build exited $RC. An exit of 143 is SIGTERM, which means the JOB was cancelled rather than the build failing - check for a Cancel action in the Actions UI."
+            echo "::error::kleaf build exited $RC. An exit of 143 is SIGTERM, meaning the JOB was cancelled rather than the build failing - check the Actions billing/spending limit (dispatch .github/workflows/canary.yml) and whether anyone pressed Cancel."
           fi
           exit "$RC"
 

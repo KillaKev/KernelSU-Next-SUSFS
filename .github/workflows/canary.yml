@@ -1,0 +1,38 @@
+name: Actions canary (spending-limit probe)
+
+# WHY THIS EXISTS
+# Two long builds (runs #7 and #8) were killed by an orderly SIGTERM ~58-60 min in, with
+#     Bazel caught terminate signal; shutting down.
+#     ##[error]The runner has received a shutdown signal...
+#     ##[error]The operation was canceled.
+# and NOTHING else in the log: no compile error, no ENOSPC, no OOM. That is a CANCEL, not a
+# build failure. The workflow allows 240 min and had used ~58, there is no concurrency group,
+# and GitHub reported no incident at the time - which leaves the account's Actions
+# minutes/spending limit, since this repository is PRIVATE (private-repo minutes are billed and
+# GitHub cancels RUNNING jobs the moment the budget runs out).
+#
+# Dispatching this trivial workflow answers that in seconds:
+#   * a green run  -> Actions can still start jobs, so the long builds were not budget-blocked
+#                     (look instead for a manual cancel or something else)
+#   * a failed run -> read the annotation: when a spending limit is exhausted GitHub refuses the
+#                     job outright ("The job was not started because your account has reached
+#                     its spending limit"), which is the definitive answer.
+#
+# Cost: a few seconds of runner time. Far cheaper than discovering it 1 hour into a kernel build.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Can a job start at all?
+        run: |
+          set -e
+          echo "Actions can start jobs for this repository."
+          echo "If you are reading this line, the account is NOT over its Actions spending limit."
+          echo "date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "runner: $RUNNER_NAME / $RUNNER_OS"
+          df -h / | tail -1
