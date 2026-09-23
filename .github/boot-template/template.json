@@ -1,0 +1,19 @@
+{
+  "cmdline": "",
+  "header_size": 1584,
+  "header_version": 4,
+  "kernel_size": 25063907,
+  "os_version": 0,
+  "pad_to": 67108864,
+  "ramdisk_size": 0,
+  "reserved": [
+    0,
+    0,
+    0,
+    0
+  ],
+  "signature_size": 0,
+  "stock_file_size": 67108864,
+  "stock_kernel_sha256": "af2515d5c9d35d9e5d00ad73a8ba28300d24f70c848651a3cc3731f4e5d7885d",
+  "stock_kernel_size": 25063907
+}

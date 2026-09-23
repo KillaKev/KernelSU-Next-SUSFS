@@ -716,6 +716,77 @@ jobs:
           path: ${{ runner.temp }}/artifacts/*
           if-no-files-found: error
           retention-days: 14
+      # ---------------------------------------------------------------- boot.img packing
+      # The lean //common:kernel_aarch64 target emits Image and Image.lz4 only - no boot.img - so this
+      # packs a flashable one from the STOCK boot header. The template was extracted from
+      # nothing_stock_baseline/flash_tool_readback/ReadBack_..._boot_a_boot.img and committed as
+      # .github/boot-template/boot-header.bin. Its values: header_version 4, header_size 1584,
+      # ramdisk_size 0 (the ramdisk lives in init_boot on this device), signature_size 0 (the AVB
+      # chain is in the vbmeta partition), kernel at page 4096. Copying that header verbatim and
+      # swapping only kernel_size means every field the bootloader reads stays byte-identical to
+      # stock. .github/scripts/pack_boot.py rebuilds the image and then re-parses it, failing unless
+      # each field matches the template and the kernel payload hashes to Image.lz4.
+      # This step runs AFTER the Image upload on purpose: a packing problem can never cost you the
+      # kernel that already built.
+      - name: Pack Image.lz4 into a flashable boot.img (stock template) and verify
+        run: |
+          cd "$WORKDIR"
+          set -e
+          TEMPLATE="$GITHUB_WORKSPACE/.github/boot-template"
+          K=bazel-bin/common/kernel_aarch64/Image.lz4
+          IMG=bazel-bin/common/kernel_aarch64/Image
+          EXPECT="5.15.197-android13-8-00005-g2d8ad9139b89-ab15063902"
+
+          if [ ! -f "$TEMPLATE/boot-header.bin" ]; then
+            echo "::warning::no committed boot template at $TEMPLATE/boot-header.bin - skipping boot.img"
+            exit 0
+          fi
+          test -f "$K" || { echo "::error::$K is missing - nothing to pack"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/artifacts-boot"
+
+          # (1) THE TRUST CHAIN. Prove the COMPRESSED kernel unpacks to exactly the Image whose
+          # release string step 13 asserted, so the bytes going into boot.img are the verified ones.
+          command -v lz4 >/dev/null 2>&1 || sudo apt-get install -y -qq lz4 >/dev/null 2>&1 || true
+          if command -v lz4 >/dev/null 2>&1; then
+            lz4 -d -l -c "$K" > "$RUNNER_TEMP/Image.from-lz4" 2>/dev/null || \
+              lz4 -d -c "$K" > "$RUNNER_TEMP/Image.from-lz4"
+            A=$(sha256sum "$IMG" | cut -d' ' -f1)
+            B=$(sha256sum "$RUNNER_TEMP/Image.from-lz4" | cut -d' ' -f1)
+            echo "Image            sha256: $A"
+            echo "lz4 -d Image.lz4 sha256: $B"
+            if [ "$A" != "$B" ]; then
+              echo "::error::Image.lz4 does not decompress to the built Image"
+              exit 1
+            fi
+            echo "OK   Image.lz4 decompresses to the very Image whose release string was verified"
+            strings -a "$RUNNER_TEMP/Image.from-lz4" | grep -qxF "$EXPECT" || \
+              { echo "::error::the kernel going into boot.img does not carry $EXPECT"; exit 1; }
+            echo "OK   the kernel going into boot.img carries the stock release string"
+            if strings -a "$RUNNER_TEMP/Image.from-lz4" | grep -q -- '-maybe-dirty'; then
+              echo "::error::the kernel going into boot.img still carries -maybe-dirty"
+              exit 1
+            fi
+            echo "OK   no -maybe-dirty in the kernel going into boot.img"
+          else
+            echo "::warning::lz4 unavailable - skipping the decompression cross-check"
+          fi
+
+          # (2) pack against the stock header, then verify field by field
+          python3 "$GITHUB_WORKSPACE/.github/scripts/pack_boot.py" pack \
+            --template-dir "$TEMPLATE" \
+            --kernel "$K" \
+            --output "$RUNNER_TEMP/artifacts-boot/boot.img"
+          ls -la "$RUNNER_TEMP/artifacts-boot"
+
+      - name: Upload flashable boot.img
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-boot-${{ github.run_number }}
+          path: ${{ runner.temp }}/artifacts-boot/*
+          if-no-files-found: error
+          retention-days: 14
+
+
 
 
 
