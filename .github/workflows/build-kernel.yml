@@ -27,6 +27,14 @@ on:
         description: 'Bazel target to build. //common:kernel_aarch64_dist builds the kernel PLUS every GKI module and the whole dist dir (tens of GB, the long pole). //common:kernel_aarch64 builds just the kernel Image + Image.lz4 - which is all boot.img needs, since the 235 vendor modules are prebuilt on-device and load by KMI.'
         required: true
         default: '//common:kernel_aarch64'
+      patches:
+        description: 'What to integrate. ksu-susfs = KernelSU-Next + SUSFS (the real build). none = VANILLA CONTROL: the same pinned release tree, the same stock config and the same stock release string, but with no KernelSU/SUSFS at all - this isolates the build recipe (kleaf flags, toolchain, packing) from the patches.'
+        required: true
+        default: 'ksu-susfs'
+        type: choice
+        options:
+          - ksu-susfs
+          - none
 
 
 jobs:
@@ -273,7 +281,13 @@ jobs:
       # setup.sh from pershoot's fork already hardcodes OWNER="pershoot" and performs the
       # drivers/kernelsu symlink + Kconfig/Makefile wiring itself, so this stays a one-line
       # change to the source and NOTHING else about the integration mechanism changes.
+      # VANILLA CONTROL: with patches=none every KSU/SUSFS step is skipped, and the smoke-test step
+      # then asserts the opposite of what it asserts for a real build (KSU must be ABSENT). The rest
+      # of the pipeline - tree pin, .scmversion, stamp/LTO, drift gate, release assertion, packing -
+      # is untouched, so a vanilla run answers exactly one question: does this BUILD RECIPE produce a
+      # kernel this phone will boot, with no patches in the picture at all?
       - name: Integrate KernelSU-Next + SUSFS (${{ inputs.ksu_branch }})
+        if: inputs.patches != 'none'
         run: |
           cd "$WORKDIR/common"
           set -e
@@ -313,6 +327,7 @@ jobs:
       # manually by yourself" — our KMI revision (2026-03) is newer than the one the SUSFS
       # branch was cut from, so a couple of include-block hunks reject. Tolerate + repair.
       - name: Apply SUSFS (full 3-part procedure)
+        if: inputs.patches != 'none'
         run: |
           cd "$WORKDIR"
           git clone --depth=1 -b "${{ inputs.susfs_branch }}" \
@@ -385,6 +400,7 @@ jobs:
       # from its OWN added lines, anchoring on the last NON-BLANK context line - anchoring on the
       # blank one matches the file's first empty line and would drop the code into the header.
       - name: Repair rejected hunks (re-apply them from their own content)
+        if: inputs.patches != 'none'
         run: |
           cd "$WORKDIR/common"
           echo "=================== REJECTED HUNKS (before repair) ==================="
@@ -465,6 +481,7 @@ jobs:
       # the real build. Both are verified by grepping the GENERATED .config - which is the only
       # thing that actually proves the options landed.
       - name: Stage the KSU + SUSFS kernel config options
+        if: inputs.patches != 'none'
         run: |
           cd "$WORKDIR/common"
           set -e
@@ -516,12 +533,26 @@ jobs:
           fi
           echo "OK   no -maybe-dirty left under build/ or common/scripts"
 
-          echo "============ append the options to gki_defconfig ============"
+          echo "============ gki_defconfig ============"
           DEF=./common/arch/arm64/configs/gki_defconfig
           cp "$DEF" /tmp/gki_defconfig.orig
-          cat "$RUNNER_TEMP/susfs.config" >> "$DEF"
-          echo "--- defconfig tail ---"
-          tail -14 "$DEF"
+          if [ "${{ inputs.patches }}" = "none" ]; then
+            # VANILLA CONTROL: no option fragment is appended at all, so the defconfig must still be
+            # the pinned tree's own file. Prove that here. If anything had already touched it, the
+            # "vanilla" build would not be a control and any conclusion drawn from it would be wrong.
+            echo "patches=none: appending NOTHING to gki_defconfig"
+            if git -C common diff --quiet -- arch/arm64/configs/gki_defconfig; then
+              echo "OK   gki_defconfig is byte-identical to the pinned tree's copy"
+            else
+              echo "::error::gki_defconfig was modified before the vanilla build - not a control"
+              git -C common diff -- arch/arm64/configs/gki_defconfig | head -40
+              exit 1
+            fi
+          else
+            cat "$RUNNER_TEMP/susfs.config" >> "$DEF"
+            echo "--- defconfig tail ---"
+            tail -14 "$DEF"
+          fi
 
           echo "============ neutralise the legacy check_defconfig guard ============"
           # RUN #6 LESSON: the guard is not in kleaf at all. It is a bash function in
@@ -568,6 +599,19 @@ jobs:
             if [ "${GOT:-0}" -eq 0 ]; then
               echo "::warning::could not observe the SUSFS options in either artifact - the post-build marker grep is the backstop"
             fi
+          elif [ "${{ inputs.patches }}" = "none" ]; then
+            # VANILLA CONTROL: the generated .config must contain NO KernelSU/SUSFS option at all.
+            # This is the inverse of the real build's check and is the whole point of the control:
+            # if a KSU line survived, the run would not isolate the build recipe from the patches.
+            echo "--- VANILLA: KernelSU/SUSFS must be ABSENT from the generated .config ---"
+            if grep -qE '^CONFIG_(KSU|KSU_SUSFS|KSU_THRONE)' "$CFG"; then
+              echo "::error::patches=none but the generated .config carries KernelSU/SUSFS options"
+              grep -nE '^CONFIG_(KSU|KSU_SUSFS|KSU_THRONE)' "$CFG"
+              exit 1
+            fi
+            echo "OK   no CONFIG_KSU*/KSU_SUSFS*/KSU_THRONE* in the generated .config"
+            echo "--- for reference, the options a real build adds and this one must NOT have: ---"
+            head -5 "$GITHUB_WORKSPACE/.github/scripts/susfs.config"
           else
             echo "--- KSU lines ---"
             grep -nE '^CONFIG_(KSU|KSU_SUSFS)|^# CONFIG_KSU' "$CFG" || echo "(no KSU lines at all)"
@@ -620,7 +664,15 @@ jobs:
           echo "[5] every Kconfig predicate mentioning it:"
           grep -rn 'MODULE_SCMVERSION' --include=Kconfig* common/ 2>/dev/null | head -10 || true
 
-          python3 "$GITHUB_WORKSPACE/.github/scripts/kernel_config_diff.py" --config "$CFG"
+          # For the vanilla control the expected drift is exactly ONE key: UNUSED_KSYMS_WHITELIST,
+          # whose value is unavoidably a build-machine path. Any CONFIG_KSU* difference at all would
+          # mean the control is not a control, so ask for strict mode (no KSU allowance).
+          STRICT=""
+          if [ "${{ inputs.patches }}" = "none" ]; then
+            STRICT="--strict"
+            echo "patches=none: drift gate runs in STRICT mode (only UNUSED_KSYMS_WHITELIST may differ)"
+          fi
+          python3 "$GITHUB_WORKSPACE/.github/scripts/kernel_config_diff.py" --config "$CFG" $STRICT
 
       - name: kleaf build ${{ inputs.build_target }}
         timeout-minutes: 200
@@ -741,8 +793,18 @@ jobs:
             fi
           fi
           echo "--- KSU/SUSFS markers in the built kernel ---"
-          strings -a bazel-bin/common/kernel_aarch64/Image | grep -m10 -iE 'kernelsu|susfs' || \
+          MARKERS=$(strings -a bazel-bin/common/kernel_aarch64/Image | grep -m10 -iE 'kernelsu|susfs' || true)
+          if [ -n "$MARKERS" ]; then
+            echo "$MARKERS"
+            if [ "${{ inputs.patches }}" = "none" ]; then
+              echo "::error::patches=none but the built Image mentions kernelsu/susfs - the vanilla control is contaminated"
+              exit 1
+            fi
+          elif [ "${{ inputs.patches }}" = "none" ]; then
+            echo "OK   vanilla: no kernelsu/susfs strings in the Image"
+          else
             echo "(none found - KSU may be built as a loadable module)"
+          fi
           echo "--- version string baked into the kernel ---"
           strings -a bazel-bin/common/kernel_aarch64/Image | grep -m3 -E '5\.15\.197' || true
 

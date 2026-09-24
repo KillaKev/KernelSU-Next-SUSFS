@@ -44,6 +44,9 @@ def main():
     ap.add_argument("--config", required=True, help="the generated .config from this build")
     ap.add_argument("--stock", default=DEFAULT_STOCK, help="reference config (default: stock)")
     ap.add_argument("--allow-regex", default=None, help="override the allowed-difference pattern")
+    ap.add_argument("--strict", action="store_true",
+                    help="vanilla control: allow ONLY the UNUSED_KSYMS_WHITELIST path, so any "
+                         "KernelSU/SUSFS line at all counts as drift")
     args = ap.parse_args()
 
     if not os.path.exists(args.stock):
@@ -58,6 +61,9 @@ def main():
     with open(args.stock, encoding="utf-8", errors="replace") as fh:
         stock = parse(fh.read())
     allowed = re.compile(args.allow_regex) if args.allow_regex else ALLOWED
+    if args.strict:
+        # Vanilla control: the ONLY difference that may exist is the whitelist's build-machine path.
+        allowed = re.compile(r"^CONFIG_UNUSED_KSYMS_WHITELIST")
 
     only_stock = sorted(set(stock) - set(ours))
     only_ours = sorted(set(ours) - set(stock))
