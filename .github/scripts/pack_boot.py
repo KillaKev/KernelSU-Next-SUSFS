@@ -19,6 +19,23 @@ Subcommands:
 `pack` re-parses what it wrote and fails unless every field except kernel_size is byte-identical to the
 template and the kernel payload hashes to the input kernel.
 """
+# ==============================================================================================
+# RETIRED - DO NOT USE FOR FLASHABLE IMAGES.
+#
+# The `pack` subcommand below rebuilds the image from the stock HEADER and ZERO-FILLS everything
+# after the kernel blob. That deletes:
+#     * the AVB vbmeta struct ("AVB0") at the page-aligned offset immediately after the kernel
+#     * the AVB footer ("AVBf") in the last 64 bytes of the partition
+# Measured: stock carries 4,709 non-zero bytes after the kernel, a magiskboot pack 1,140, and an
+# image from this script ZERO - and the bootloader refuses those. Runs #16 and #21 were packed
+# with this script: both compiled fine, both flashed cleanly, both BOOTLOOPED, and both kernels
+# were innocent.
+#
+# The workflow now packs with magiskboot against the committed stock image
+# (.github/boot-template/stock-boot.img.gz) and gates the result with
+# .github/scripts/verify_boot_img.py. The header/layout notes here are still useful reading, and
+# `extract-template` remains harmless, but `pack` must not be used again.
+# ==============================================================================================
 import argparse
 import hashlib
 import json

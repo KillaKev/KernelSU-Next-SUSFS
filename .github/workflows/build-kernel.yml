@@ -869,54 +869,75 @@ jobs:
       # each field matches the template and the kernel payload hashes to Image.lz4.
       # This step runs AFTER the Image upload on purpose: a packing problem can never cost you the
       # kernel that already built.
-      - name: Pack Image.lz4 into a flashable boot.img (stock template) and verify
+      - name: Pack Image into a flashable boot.img (magiskboot, AVB preserved) and verify
         run: |
           cd "$WORKDIR"
           set -e
+          # ==================== THE HARDEST LESSON IN THIS REPO ====================
+          # Runs #16 and #21 packed "successfully", flashed cleanly, and BOOTLOOPED. The kernels
+          # were fine. The old pack_boot.py rebuilt the image from the stock HEADER and zero-filled
+          # everything after the kernel blob, which deleted:
+          #     * the AVB vbmeta struct ("AVB0") at the page-aligned offset just after the kernel
+          #     * the AVB footer ("AVBf") in the last 64 bytes of the partition
+          # Measured on four real images:
+          #     boot-stock.img    4,709 non-zero bytes after the kernel   AVBf present   BOOTS
+          #     magiskboot pack   1,140 non-zero bytes after the kernel   AVBf present   BOOTS
+          #     old pack_boot.py  0     non-zero bytes after the kernel   no AVBf        BOOTLOOPS
+          # The bootloader refuses an image without those structures, and NO kernel-side check can
+          # catch it - the bug lives entirely outside the kernel. So this step now uses magiskboot
+          # (the tool that produced the image which booted on the device) to edit the committed
+          # stock image in place, and then GATES on the structures being intact.
           TEMPLATE="$GITHUB_WORKSPACE/.github/boot-template"
-          K=bazel-bin/common/kernel_aarch64/Image.lz4
+          STOCK_GZ="$TEMPLATE/stock-boot.img.gz"
+          STOCK_GZ_SHA=84e5923045a669efd852243fab8ac8f062d9710802ff117715a579b5ed766101
           IMG=bazel-bin/common/kernel_aarch64/Image
+          OUT="$RUNNER_TEMP/artifacts-boot/boot.img"
           EXPECT="5.15.197-android13-8-00005-g2d8ad9139b89-ab15063902"
 
-          if [ ! -f "$TEMPLATE/boot-header.bin" ]; then
-            echo "::warning::no committed boot template at $TEMPLATE/boot-header.bin - skipping boot.img"
-            exit 0
-          fi
-          test -f "$K" || { echo "::error::$K is missing - nothing to pack"; exit 1; }
-          mkdir -p "$RUNNER_TEMP/artifacts-boot"
+          test -f "$STOCK_GZ" || { echo "::error::no stock boot image at $STOCK_GZ - cannot pack"; exit 1; }
+          test -f "$IMG"      || { echo "::error::$IMG is missing - nothing to pack"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/artifacts-boot" "$RUNNER_TEMP/pack"
 
-          # (1) THE TRUST CHAIN. Prove the COMPRESSED kernel unpacks to exactly the Image whose
-          # release string step 13 asserted, so the bytes going into boot.img are the verified ones.
-          command -v lz4 >/dev/null 2>&1 || sudo apt-get install -y -qq lz4 >/dev/null 2>&1 || true
-          if command -v lz4 >/dev/null 2>&1; then
-            lz4 -d -l -c "$K" > "$RUNNER_TEMP/Image.from-lz4" 2>/dev/null || \
-              lz4 -d -c "$K" > "$RUNNER_TEMP/Image.from-lz4"
-            A=$(sha256sum "$IMG" | cut -d' ' -f1)
-            B=$(sha256sum "$RUNNER_TEMP/Image.from-lz4" | cut -d' ' -f1)
-            echo "Image            sha256: $A"
-            echo "lz4 -d Image.lz4 sha256: $B"
-            if [ "$A" != "$B" ]; then
-              echo "::error::Image.lz4 does not decompress to the built Image"
-              exit 1
-            fi
-            echo "OK   Image.lz4 decompresses to the very Image whose release string was verified"
-            strings -a "$RUNNER_TEMP/Image.from-lz4" | grep -qxF "$EXPECT" || \
-              { echo "::error::the kernel going into boot.img does not carry $EXPECT"; exit 1; }
-            echo "OK   the kernel going into boot.img carries the stock release string"
-            if strings -a "$RUNNER_TEMP/Image.from-lz4" | grep -q -- '-maybe-dirty'; then
-              echo "::error::the kernel going into boot.img still carries -maybe-dirty"
-              exit 1
-            fi
-            echo "OK   no -maybe-dirty in the kernel going into boot.img"
-          else
-            echo "::warning::lz4 unavailable - skipping the decompression cross-check"
+          echo "============ (0) the raw kernel going in ============"
+          ls -la "$IMG"
+          strings -a "$IMG" | grep -qxF "$EXPECT" || \
+            { echo "::error::the raw Image does not carry the stock release string $EXPECT"; exit 1; }
+          echo "OK   raw Image carries the exact stock release string"
+          if strings -a "$IMG" | grep -q -- '-maybe-dirty'; then
+            echo "::error::the raw Image carries -maybe-dirty"; exit 1
           fi
+          echo "OK   raw Image carries no -maybe-dirty"
 
-          # (2) pack against the stock header, then verify field by field
-          python3 "$GITHUB_WORKSPACE/.github/scripts/pack_boot.py" pack \
-            --template-dir "$TEMPLATE" \
-            --kernel "$K" \
-            --output "$RUNNER_TEMP/artifacts-boot/boot.img"
+          echo "============ (1) pinned standalone magiskboot ============"
+          MAGISKBOOT_SHA=1c812bea748c417c4edbe0600eb0e21ee1f0c8988254d67b40408aa41e9e899b
+          curl -sSL --retry 3 -o "$RUNNER_TEMP/magiskboot" \
+            https://github.com/WildKernels/magiskboot/releases/download/nightly/magiskboot-x86_64
+          echo "$MAGISKBOOT_SHA  $RUNNER_TEMP/magiskboot" | sha256sum -c - || \
+            { echo "::error::magiskboot download did not match the pinned sha256"; exit 1; }
+          chmod +x "$RUNNER_TEMP/magiskboot"
+          MB="$RUNNER_TEMP/magiskboot"
+          "$MB" | head -2 || true
+
+          echo "============ (2) the stock image IS the AVB template ============"
+          echo "$STOCK_GZ_SHA  $STOCK_GZ" | sha256sum -c -
+          cd "$RUNNER_TEMP/pack"
+          gunzip -c "$STOCK_GZ" > boot.img
+          echo "template size: $(stat -c%s boot.img) bytes"
+          echo "--- what the template looks like to magiskboot ---"
+          "$MB" unpack boot.img
+          echo "--- the stock kernel it carried (will be replaced) ---"
+          ls -la kernel
+
+          echo "============ (3) swap in THIS build's kernel and repack ============"
+          cp -v "$WORKDIR/$IMG" kernel
+          "$MB" repack boot.img "$OUT"
+          echo "--- magiskboot verify of the packed image ---"
+          "$MB" verify "$OUT"
+
+          echo "============ (4) THE GATE: shaped like an image that boots? ============"
+          python3 "$GITHUB_WORKSPACE/.github/scripts/verify_boot_img.py" \
+            "$OUT" --expect-kernel "$WORKDIR/$IMG"
+
           ls -la "$RUNNER_TEMP/artifacts-boot"
 
       - name: Upload flashable boot.img
