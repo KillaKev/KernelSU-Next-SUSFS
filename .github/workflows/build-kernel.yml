@@ -317,6 +317,49 @@ jobs:
           done
           echo "OK - KernelSU-Next carries SUSFS and exports the API the kernel patch needs"
 
+          # ---- RUN #23 LESSON: KSU_VERSION MUST NOT FALL BACK TO 1 -------------------------
+          # The manager showed the installed KernelSU version as "1" and then refused to install
+          # modules. Cause, straight out of KernelSU-Next/kernel/Kbuild:
+          #
+          #   GIT_ROOT=$(git rev-parse --show-toplevel)                        # the KSU checkout
+          #   KERNEL_GIT_ROOT=$(git rev-parse --show-toplevel in $(srctree))
+          #   ifneq ($(GIT_ROOT),$(KERNEL_GIT_ROOT))        <- only then is the version computed
+          #       KSU_GIT_VERSION=$(git rev-list --count $(merge-base HEAD origin/<base>))
+          #       KSU_VERSION=$((30000 + KSU_GIT_VERSION))  # "major * 30000 + git version"
+          #   else
+          #       KSU_VERSION_FALLBACK := 1                 <- what we were shipping
+          #
+          # Under kleaf the kernel builds in a SANDBOX where the .git pointers do not survive (this
+          # repo already saw "symlink has no referent: common/source/.git, rsync error"), so the git
+          # test fails, KSU_GIT_VERSION_VALID is never set, and the kernel is compiled with
+          # KSU_VERSION=1. The manager reads that number back and gates module installation on it.
+          #
+          # Fix: compute the version HERE, where git definitely works, and pin it into the fallback
+          # so the sandbox cannot change the answer. Idempotent and verified below.
+          KSU_DIR="$WORKDIR/common/KernelSU-Next"
+          BASE_BRANCH=$(git -C "$KSU_DIR" rev-parse --abbrev-ref HEAD | sed 's:-.*::')
+          BASE_COMMIT=$(git -C "$KSU_DIR" merge-base HEAD "refs/remotes/origin/$BASE_BRANCH" 2>/dev/null \
+                        || git -C "$KSU_DIR" merge-base HEAD refs/remotes/origin/main 2>/dev/null \
+                        || echo HEAD)
+          KSU_GIT_VERSION=$(git -C "$KSU_DIR" rev-list --count "$BASE_COMMIT")
+          KSU_TAG=$(git -C "$KSU_DIR" describe --tags --abbrev=0 "$BASE_COMMIT" 2>/dev/null || echo v0.0.0)
+          KSU_VERSION=$((30000 + KSU_GIT_VERSION))
+          echo "KernelSU-Next base branch  : $BASE_BRANCH"
+          echo "KernelSU-Next base commit  : $BASE_COMMIT"
+          echo "KernelSU-Next commit count : $KSU_GIT_VERSION"
+          echo "KernelSU-Next latest tag   : $KSU_TAG"
+          echo "=> KSU_VERSION the manager must see: $KSU_VERSION  (was 1)"
+          KBUILD=KernelSU-Next/kernel/Kbuild
+          sed -i "s/^KSU_VERSION_FALLBACK := 1$/KSU_VERSION_FALLBACK := ${KSU_VERSION}/" "$KBUILD"
+          sed -i "s/^KSU_VERSION_TAG_FALLBACK := v0.0.1$/KSU_VERSION_TAG_FALLBACK := ${KSU_TAG}/" "$KBUILD"
+          echo "--- Kbuild fallback lines after the patch ---"
+          grep -n 'KSU_VERSION_FALLBACK' "$KBUILD"
+          grep -q "KSU_VERSION_FALLBACK := ${KSU_VERSION}" "$KBUILD" || \
+            { echo "::error::could not pin KSU_VERSION_FALLBACK to ${KSU_VERSION} - the manager would read 1 again"; exit 1; }
+          grep -q "KSU_VERSION_TAG_FALLBACK := ${KSU_TAG}" "$KBUILD" || \
+            { echo "::error::could not pin KSU_VERSION_TAG_FALLBACK to ${KSU_TAG}"; exit 1; }
+          echo "OK   KSU_VERSION will be ${KSU_VERSION} even inside the kleaf sandbox"
+
       # ---------------------------------------------------------------- SUSFS
       # RUN #2 LESSON: the OFFICIAL procedure (susfs4ksu README) is THREE parts, not one:
       #   1. copy the SUSFS source files in (kernel_patches/fs/*, include/linux/*)
