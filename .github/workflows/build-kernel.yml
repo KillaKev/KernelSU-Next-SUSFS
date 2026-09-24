@@ -219,8 +219,15 @@ jobs:
           # disagree. NOTE: no trailing newline - it would end up inside the version string.
           # Keep EXPECT_REL identical to EXPECT in the inspect step.
           EXPECT_REL=5.15.197-android13-8-00005-g2d8ad9139b89-ab15063902
+          # RUN #20 LESSON - the -ab<BUILD_NUMBER> tail must be supplied HERE, not left to the build.
+          # With --config=stamp kleaf takes the version from this file, and the ACK's setlocalversion
+          # only appends `-ab${BUILD_NUMBER}` when BUILD_NUMBER is exported - Google's build sets it
+          # (15063902 is the platform build number in the device's own release string) and ours does
+          # not. Without it, run #20 produced 5.15.197-android13-8-00005-g2d8ad9139b89 and the
+          # assertion below correctly refused it. Supplying the value in this file keeps the release -
+          # and therefore the vermagic - identical to stock, while leaving CONFIG_LOCALVERSION="" and
+          # CONFIG_LOCALVERSION_AUTO=y exactly as the stock config has them.
           SCM_PART=${EXPECT_REL#5.15.197}     # -android13-8-00005-g2d8ad9139b89-ab15063902
-          SCM_PART=${SCM_PART%-ab*}           # -android13-8-00005-g2d8ad9139b89
           echo "common/.scmversion before: $(cat common/.scmversion 2>/dev/null || echo '<absent>')"
           printf '%s' "$SCM_PART" > common/.scmversion
           echo "common/.scmversion after:  $(cat common/.scmversion)"
