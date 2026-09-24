@@ -974,10 +974,44 @@ jobs:
           echo "============ (3) swap in THIS build's kernel and repack ============"
           cp -v "$WORKDIR/$IMG" kernel
           "$MB" repack boot.img "$OUT"
-          echo "--- magiskboot verify of the packed image ---"
+          echo "--- magiskboot verify of the packed image (INFORMATIONAL - a non-zero result is EXPECTED) ---"
+          # RUN #23 LESSON. This returned 1 and `set -e` failed the whole step, so a perfectly good
+          # boot.img was never uploaded. `magiskboot verify` answers exactly one question - "is this
+          # image AVB 1.0 signed?" - and it returns 1 when it is not.
+          #
+          # The stock image IS signed. Parsed straight out of the committed template:
+          #     AvbVBMetaImageHeader.algorithm_type = 2 (SHA256_RSA4096), signature 512 B, key 1032 B
+          # Repacking swaps the kernel in, which changes the vbmeta hash descriptor that the signature
+          # covers. We do not hold the vendor's private key, so magiskboot rebuilds the vbmeta struct
+          # WITHOUT a signature - measured: the tail drops from 4,709 to 1,140 non-zero bytes, and that
+          # is exactly what the image which BOOTED on the device looked like. No custom kernel can pass
+          # this check on any device, and none needs to here: the bootloader is unlocked, so boot
+          # verification is not enforced. So report the result, and do not gate on it.
+          #
+          # The real gate is verify_boot_img.py below: it checks the structures the bootloader actually
+          # reads - AVB0 struct at the page-aligned kernel end, AVBf footer, and the kernel payload hash.
+          set +e
           "$MB" verify "$OUT"
+          VERIFY_RC=$?
+          set -e
+          echo "magiskboot verify exit=$VERIFY_RC (non-zero is EXPECTED - we cannot re-sign for the vendor key)"
 
           echo "============ (4) THE GATE: shaped like an image that boots? ============"
+          # RUN #23 LESSON (part two). verify_boot_img.py decompresses the lz4_legacy payload to prove
+          # the image carries THIS kernel rather than a stale blob, and that needs the python lz4
+          # module. The runner image does not guarantee it; without it the payload comparison cannot
+          # run at all and the gate would fail on an ImportError instead of on a real problem.
+          if ! python3 -c 'import lz4.block' >/dev/null 2>&1; then
+            echo "--- python lz4 missing - installing it so the payload check can run ---"
+            sudo apt-get install -y -qq python3-lz4 >/dev/null 2>&1 || \
+              python3 -m pip install --quiet --break-system-packages lz4 || \
+              python3 -m pip install --quiet lz4 || true
+          fi
+          python3 -c 'import lz4.block' || {
+            echo "::error::python lz4 is unavailable, so the payload cannot be decompressed and PROVED to be this kernel"
+            exit 1
+          }
+          echo "OK   python lz4 present - the payload comparison will run"
           python3 "$GITHUB_WORKSPACE/.github/scripts/verify_boot_img.py" \
             "$OUT" --expect-kernel "$WORKDIR/$IMG"
 

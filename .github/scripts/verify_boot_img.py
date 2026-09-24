@@ -68,8 +68,21 @@ def main():
     print("  AFTER kernel   : %d non-zero bytes" % non_zero)
     avb0_here = bytes(d[k_page_end:k_page_end + 4]) == AVB0
     print("  AVB0 at %d : %s" % (k_page_end, "YES" if avb0_here else "NO"))
+    if not avb0_here:
+        # Diagnostic only - still a failure below. Stock and magiskboot both land the struct
+        # exactly at the page-aligned kernel end; anything else means the layout drifted away
+        # from the one image we know boots. Say where it actually went, so the log explains
+        # itself instead of just saying "missing".
+        found = d.find(AVB0, PAGE)
+        print("  AVB0 actually at  : %s"
+              % (found if found >= 0 else "<absent from the whole image>"))
     avbf_here = bytes(d[-64:-60]) == AVBF
     print("  AVBf in tail   : %s" % ("YES" if avbf_here else "NO"))
+    if avbf_here:
+        # AvbFooter is big-endian: original_image_size @12, vbmeta_offset @20, vbmeta_size @28
+        print("  AVBf says vbmeta  : offset %d size %d"
+              % (struct.unpack_from(">Q", d, len(d) - 64 + 20)[0],
+                 struct.unpack_from(">Q", d, len(d) - 64 + 28)[0]))
 
     if version != 4:
         problems.append("header_version %d is not 4" % version)
