@@ -996,6 +996,23 @@ jobs:
           set -e
           echo "magiskboot verify exit=$VERIFY_RC (non-zero is EXPECTED - we cannot re-sign for the vendor key)"
 
+          # ---- RUN #24 LESSON: the boot vbmeta image_size decides boot vs bootloop ----------
+          # kernel-boot-24 flashed OKAY on the device and BOOTLOOPED. The image was structurally
+          # perfect (AVB0 present, AVBf present, 1140 non-zero tail bytes, gate green) and its
+          # kernel was byte-identical to the artifact that boots. The ENTIRE difference from a
+          # booting image was one 64-bit field: the boot vbmeta hash descriptor's `image_size`.
+          #
+          #     stock template        25,063,424       footer original_image_size 25,088,000
+          #     e159716 magiskboot    25,088,000  <- keeps the stock template's value   BOOTS
+          #     nightly magiskboot    21,606,400  <- rewrites it to its own footer value BOOTLOOP
+          #
+          # Proven on hardware: take the CI image, change ONLY those 2 bytes back to 25,088,000,
+          # flash it -> boots (boot_completed=1, byte-exact uname, su works). So normalise it back
+          # to the template value here, and never rely on the packer's opinion again.
+          echo "============ (3b) normalise the boot vbmeta image_size to the stock value ============"
+          python3 "$GITHUB_WORKSPACE/.github/scripts/normalize_vbmeta.py" \
+            --stock "$STOCK_GZ" --image "$OUT"
+
           echo "============ (4) THE GATE: shaped like an image that boots? ============"
           # RUN #23 LESSON (part two). verify_boot_img.py decompresses the lz4_legacy payload to prove
           # the image carries THIS kernel rather than a stale blob, and that needs the python lz4
