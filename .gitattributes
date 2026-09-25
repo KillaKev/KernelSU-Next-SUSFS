@@ -1,0 +1,12 @@
+# Vendored binaries must stay BYTE-EXACT.
+#
+# .github/boot-template/magiskboot-x86_64 is a static x86_64 ELF that the pack step copies
+# and checks against a pinned sha256. If git is allowed to apply core.autocrlf to it, the
+# working tree copy (and therefore the copy CI checks out) gains CR bytes and the run dies
+# with "does not match the pinned sha256". Marked binary so git never touches its contents.
+#
+# The same reasoning applies to every other blob in boot-template: the stock boot image is
+# gzipped and the header template is raw binary.
+.github/boot-template/magiskboot-x86_64 binary
+.github/boot-template/*.bin binary
+.github/boot-template/*.gz binary

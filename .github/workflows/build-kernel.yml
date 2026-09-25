@@ -952,12 +952,27 @@ jobs:
           echo "OK   raw Image carries no -maybe-dirty"
 
           echo "============ (1) pinned standalone magiskboot ============"
-          MAGISKBOOT_SHA=1c812bea748c417c4edbe0600eb0e21ee1f0c8988254d67b40408aa41e9e899b
-          curl -sSL --retry 3 -o "$RUNNER_TEMP/magiskboot" \
-            https://github.com/WildKernels/magiskboot/releases/download/nightly/magiskboot-x86_64
+          MAGISKBOOT_SHA=0c5b4f2b4a2dba9a2d1797da98f03371aa695be1b7db5dc60815c5b34f69faa0
+          # RUN #25 LESSON. This block used to `curl` the asset straight off a rolling release:
+          #   https://github.com/WildKernels/magiskboot/releases/download/nightly/magiskboot-x86_64
+          # and check it against a pinned sha256. `nightly` is a MUTABLE TAG: it was rebuilt
+          # (nightly 32998d6 -> nightly 5b06d81, published 2026-09-25T08:31:49Z) and the old pinned
+          # digest 1c812bea... stopped matching, so run #25 died right here in step (1) - before the
+          # pack had even started. Pinning a moving tag is a time bomb, so the binary is VENDORED
+          # now and the pin becomes a check on our own file instead of on upstream's mood.
+          #
+          # The vendored file is .github/boot-template/magiskboot-x86_64: a static x86_64 ELF from
+          # WildKernels/magiskboot release `nightly 5b06d81`, i.e. magiskboot built from
+          # topjohnwu/Magisk @ 5b06d81. It is declared `binary` in .gitattributes so git cannot
+          # rewrite its line endings. Its exact version is NOT correctness-critical any more:
+          # step (3b) normalises the one vbmeta field that differed between magiskboot builds.
+          # The pin exists for reproducibility, not to select a behaviour.
+          MAGISKBOOT_SRC="$GITHUB_WORKSPACE/.github/boot-template/magiskboot-x86_64"
+          test -f "$MAGISKBOOT_SRC" || \
+            { echo "::error::vendored magiskboot is missing at $MAGISKBOOT_SRC"; exit 1; }
+          install -m 0755 "$MAGISKBOOT_SRC" "$RUNNER_TEMP/magiskboot"
           echo "$MAGISKBOOT_SHA  $RUNNER_TEMP/magiskboot" | sha256sum -c - || \
-            { echo "::error::magiskboot download did not match the pinned sha256"; exit 1; }
-          chmod +x "$RUNNER_TEMP/magiskboot"
+            { echo "::error::the vendored magiskboot does not match the pinned sha256 - git probably rewrote its bytes, check .gitattributes"; exit 1; }
           MB="$RUNNER_TEMP/magiskboot"
           "$MB" | head -2 || true
 
