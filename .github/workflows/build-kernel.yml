@@ -952,7 +952,7 @@ jobs:
           echo "OK   raw Image carries no -maybe-dirty"
 
           echo "============ (1) pinned standalone magiskboot ============"
-          MAGISKBOOT_SHA=0c5b4f2b4a2dba9a2d1797da98f03371aa695be1b7db5dc60815c5b34f69faa0
+          MAGISKBOOT_SHA=a18ecbd7981179494b7d281453d6c4e25b5c719e7d2ef7f6eba3c6be3043c58e
           # RUN #25 LESSON. This block used to `curl` the asset straight off a rolling release:
           #   https://github.com/WildKernels/magiskboot/releases/download/nightly/magiskboot-x86_64
           # and check it against a pinned sha256. `nightly` is a MUTABLE TAG: it was rebuilt
@@ -961,12 +961,16 @@ jobs:
           # pack had even started. Pinning a moving tag is a time bomb, so the binary is VENDORED
           # now and the pin becomes a check on our own file instead of on upstream's mood.
           #
-          # The vendored file is .github/boot-template/magiskboot-x86_64: a static x86_64 ELF from
-          # WildKernels/magiskboot release `nightly 5b06d81`, i.e. magiskboot built from
-          # topjohnwu/Magisk @ 5b06d81. It is declared `binary` in .gitattributes so git cannot
-          # rewrite its line endings. Its exact version is NOT correctness-critical any more:
-          # step (3b) normalises the one vbmeta field that differed between magiskboot builds.
-          # The pin exists for reproducibility, not to select a behaviour.
+          # RUN #26 UPDATE - the fork is GONE. The vendored file is now `lib/x86_64/libmagiskboot.so`
+          # extracted from the OFFICIAL Magisk release, not a third-party rebuild:
+          #     https://github.com/topjohnwu/Magisk/releases/download/v30.7/Magisk-v30.7.apk
+          #     apk    sha256 e0d32d2123532860f97123d927b1bb86c4e08e6fd8a48bfc6b5bee0afae9ebd5
+          # Despite the `.so` name it is a STATIC executable, which is why it needs no loader at all:
+          #     ELF ET_EXEC (2), x86-64, NO PT_INTERP and NO PT_DYNAMIC, no ld-linux/linker64 strings.
+          # Magisk only calls it `.so` because APK packaging requires natives under lib/<abi>/.
+          # It is declared `binary` in .gitattributes so git cannot rewrite its bytes, and the exact
+          # packer version is NOT correctness-critical: step (3b) normalises the one vbmeta field that
+          # differed between magiskboot builds. The pin is about reproducibility and provenance.
           MAGISKBOOT_SRC="$GITHUB_WORKSPACE/.github/boot-template/magiskboot-x86_64"
           test -f "$MAGISKBOOT_SRC" || \
             { echo "::error::vendored magiskboot is missing at $MAGISKBOOT_SRC"; exit 1; }
