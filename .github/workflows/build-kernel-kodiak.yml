@@ -584,23 +584,62 @@ jobs:
       # the thing we intend to do. `check_defconfig = "disabled"` in common/BUILD.bazel is the
       # documented way to switch it off (the legacy build.sh path is disabled too, for the same
       # reason) - exactly what WildKernels do for their 6.12 kernels.
-      - name: Disable kleaf's check_defconfig gate
+      - name: Disable kleaf's check_defconfig gate (and prove the config builds)
         run: |
           set -o pipefail
           cd "$GITHUB_WORKSPACE/kernel"
+          BAZEL=common/BUILD.bazel
+
+          # RUN #6 LESSON: this step used to guard the sed with a *global*
+          # `grep -q 'check_defconfig = "disabled"' $BAZEL` - that string exists elsewhere in the
+          # file, so the sed never ran, and nothing asserted it. The build then died 7 minutes in
+          # with:
+          #   ERROR: common/BUILD.bazel:254:14: Creating kernel config (trim) failed
+          #   ERROR: savedefconfig does not match common/arch/arm64/configs/gki_defconfig
+          # The failing target is //common:kernel_aarch64_config, which kleaf derives from the
+          # kernel_build at BUILD.bazel:254 - whose very next line is `name = "kernel_aarch64",`.
+          # So: find THAT line, insert there, and assert on that target, not on the whole file.
+          L=$(grep -n '^[[:space:]]*name = "kernel_aarch64",' "$BAZEL" | head -1 | cut -d: -f1)
+          if [ -z "${L:-}" ]; then
+            echo "::error::cannot find the \"kernel_aarch64\" target in $BAZEL"
+            grep -n 'kernel_aarch64' "$BAZEL" | head -20
+            exit 1
+          fi
+          echo "kernel_build(kernel_aarch64) name line: $BAZEL:$L"
+          if ! sed -n "${L},$((L + 12))p" "$BAZEL" | grep -q 'check_defconfig = "disabled"'; then
+            sed -i "${L}a\\    check_defconfig = \"disabled\"," "$BAZEL"
+            echo "inserted check_defconfig = \"disabled\" after line $L"
+          fi
+          if ! sed -n "${L},$((L + 12))p" "$BAZEL" | grep -q 'check_defconfig = "disabled"'; then
+            echo '::error::check_defconfig = "disabled" is NOT on the kernel_aarch64 target'
+            sed -n "${L},$((L + 12))p" "$BAZEL"
+            exit 1
+          fi
+          echo "--- kernel_aarch64 target header now ---"
+          sed -n "${L},$((L + 8))p" "$BAZEL"
+
           if [ -f common/build.config.gki ]; then
             sed -i 's/check_defconfig//' common/build.config.gki
-            echo "build.config.gki: check_defconfig removed"
+            echo "build.config.gki: check_defconfig removed (legacy build.sh path, as WildKernels do)"
           fi
-          if ! grep -q 'check_defconfig = "disabled"' common/BUILD.bazel; then
-            sed -i '/name = "kernel_aarch64",/a\    check_defconfig = "disabled",' common/BUILD.bazel
-          fi
-          grep -n -A3 'name = "kernel_aarch64",' common/BUILD.bazel | head -12
 
           # KernelSU/SUSFS export extra symbols; the ABI protected-exports list can then fail the
           # build for "exporting a protected symbol". Drop the list (same as WildKernels).
           rm -rf common/android/abi_gki_protected_exports_* 2>/dev/null || true
-          perl -pi -e 's/^\s*"protected_exports_list"\s*:\s*"android\/abi_gki_protected_exports_aarch64",\s*$//;' common/BUILD.bazel || true
+          perl -pi -e 's/^\s*"protected_exports_list"\s*:\s*"android\/abi_gki_protected_exports_aarch64",\s*$//;' "$BAZEL" || true
+
+          # Prove the config target builds NOW (minutes) instead of discovering it inside the
+          # 2-hour build - and warm the Bazel cache with the exact flags the real build uses.
+          echo "--- config-only smoke test: //common:kernel_aarch64_config ---"
+          mkdir -p /home/runner/.cache/bazel
+          if tools/bazel build --config=fast --config=stamp --disk_cache=/home/runner/.cache/bazel \
+               //common:kernel_aarch64_config 2>&1 | tee /tmp/config_smoke.log; then
+            echo "OK   kleaf accepted the patched gki_defconfig (check_defconfig is off)"
+          else
+            echo "::error::config-only build failed - check_defconfig is still active, or the options are bad"
+            grep -nE 'ERROR|error:|savedefconfig' /tmp/config_smoke.log | tail -25 || true
+            exit 1
+          fi
 
       # ------------------------------------------------------------ 9. clean the release
       # With --config=stamp kleaf derives UTS_RELEASE from SCM - that is what we want - but it
