@@ -318,6 +318,18 @@ jobs:
       # makes drivers/kernelsu + the Kconfig/Makefile wiring appear in common/. Its setup.sh
       # hardcodes its fork owner, so only that URL is passed - the tree wiring is untouched.
       #
+      # LAYOUT - verified against setup.sh's source and run #3's log, do not "tidy" this path:
+      #   setup.sh does  GKI_ROOT=$(pwd)  and  REPO="KernelSU-Next", then
+      #     - clones to            $GKI_ROOT/KernelSU-Next          (the ACK ROOT, not common/)
+      #     - checks out $1        (the KSU ref) inside that clone
+      #     - symlinks             $GKI_ROOT/common/drivers/kernelsu -> ../../KernelSU-Next/kernel
+      #     - appends              obj-$(CONFIG_KSU) += kernelsu/   to common/drivers/Makefile
+      #     - appends              source "drivers/kernelsu/Kconfig" to common/drivers/Kconfig
+      #   So it MUST run with CWD = $GITHUB_WORKSPACE/kernel (from common/ the relative symlink and
+      #   the "common/drivers" probe both come out wrong), and the checkout is always
+      #   <root>/KernelSU-Next - there is no common/KernelSU-Next. Run #3 integrated perfectly and
+      #   then failed its last diagnostic line only because that line said common/KernelSU-Next.
+      #
       # DO NOT apply susfs4ksu's kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch here.
       # That patch targets UPSTREAM tiann/KernelSU; against this fork it rejects ~10 hunks
       # (kernel/Kbuild, core/init.c, feature/sucompat.c, hook/setuid_hook.c, supercall/*,
@@ -356,7 +368,16 @@ jobs:
           echo "KSU_VERSION=$KSU_VERSION"                  >> "$GITHUB_ENV"
           echo "KSU_GIT_TAG=$KSU_GIT_TAG"                  >> "$GITHUB_ENV"
 
-          ls -la "$GITHUB_WORKSPACE/kernel/common/KernelSU-Next" | head -20
+          # Non-fatal on purpose: the runner shell is `bash -e`, and in run #3 a bare `ls` of a
+          # wrong path (exit 2) killed this step *after* the integration had already succeeded.
+          ls -la "$GITHUB_WORKSPACE/kernel/KernelSU-Next" | head -20 || true
+          # What actually matters is the wiring into the kernel tree, so assert that instead of
+          # trusting the clone's location: setup.sh must have created the relative symlink.
+          test -e "$GITHUB_WORKSPACE/kernel/common/drivers/kernelsu" \
+            || { echo "::error::common/drivers/kernelsu symlink missing - setup.sh wiring did not happen"; exit 1; }
+          echo "---- drivers/Makefile + drivers/Kconfig after wiring ----"
+          grep -n 'kernelsu' "$GITHUB_WORKSPACE/kernel/common/drivers/Makefile" \
+                            "$GITHUB_WORKSPACE/kernel/common/drivers/Kconfig" || true
 
       # The API contract that must hold before we spend two hours compiling:
       #   KernelSU side -> does the fork declare the SUSFS options at all?
@@ -366,7 +387,7 @@ jobs:
         if: ${{ inputs.patches == 'ksu-susfs' }}
         run: |
           set -o pipefail
-          KC="$GITHUB_WORKSPACE/kernel/common/KernelSU-Next/kernel/Kconfig"
+          KC="$GITHUB_WORKSPACE/kernel/KernelSU-Next/kernel/Kconfig"   # ACK root, not common/ (see step 5)
           test -f "$KC" || { echo "::error::$KC missing - KernelSU integration did not happen"; exit 1; }
           N=$(grep -c 'KSU_SUSFS' "$KC" || true)
           echo "KSU_SUSFS occurrences in KernelSU-Next/kernel/Kconfig: $N"
