@@ -530,22 +530,37 @@ jobs:
           if [ -d "$KSU_TREE" ]; then
             SYMS=$(grep -rhoE '\bsusfs_[a-z0-9_]+\(' "$KSU_TREE" --include='*.c' --include='*.h' 2>/dev/null \
                    | tr -d '(' | sort -u || true)
-            MISSING=""
+            MISSING=""; OURS=""
             for sym in $SYMS; do
-              if ! grep -qE "\b${sym}\b" include/linux/susfs.h include/linux/susfs_def.h; then
-                MISSING="$MISSING $sym"
+              # 1. declared by the SUSFS we just installed?
+              if grep -qE "\b${sym}\b" include/linux/susfs.h include/linux/susfs_def.h; then
+                continue
               fi
+              # 2. provided by the KernelSU fork itself? RUN #8 DIED HERE: dev-susfs carries its own
+              #    SUSFS-side helpers - kernel/selinux/selinux.c defines susfs_set_sid(),
+              #    susfs_is_sid_equal(), u32 susfs_ksu_sid, ... - and includes ksu.h/selinux.h, NOT
+              #    linux/susfs.h. Checking only the SUSFS headers flagged 9 of those as "missing" and
+              #    failed run #8 after 50 minutes for no reason. So: a header declaration, or a
+              #    definition line in a .c (line starts with a type / static [inline]), also counts.
+              if grep -rqE "\b${sym}\b" "$KSU_TREE" --include='*.h' 2>/dev/null \
+                 || grep -rqE "^[[:space:]]*(static[[:space:]]+)?(inline[[:space:]]+)?[A-Za-z_][A-Za-z0-9_[:space:]\*]*\b${sym}[[:space:]]*\(" \
+                      "$KSU_TREE" --include='*.c' 2>/dev/null; then
+                OURS="$OURS $sym"
+                continue
+              fi
+              MISSING="$MISSING $sym"
             done
-            echo "SUSFS symbols called by KernelSU-Next: $(echo $SYMS | wc -w)    undeclared by the installed SUSFS: $(echo $MISSING | wc -w)"
+            NSYM=$(echo $SYMS | wc -w); NOWN=$(echo $OURS | wc -w); NMISS=$(echo $MISSING | wc -w)
+            echo "SUSFS calls in KernelSU-Next: ${NSYM}   provided by the fork itself: ${NOWN}   UNRESOLVED: ${NMISS}"
             if [ -n "${MISSING// /}" ]; then
-              echo "::error::the pinned/installed SUSFS is too old for this KernelSU-Next ref"
+              echo "::error::these susfs_*() calls are declared neither by the installed SUSFS nor by KernelSU-Next:"
               for sym in $MISSING; do
-                echo "::error::  undeclared: $sym  (called from $(grep -rlE "\b${sym}\(" "$KSU_TREE" | head -1))"
+                echo "::error::  $sym   (called from $(grep -rlE "\b${sym}\(" "$KSU_TREE" | head -1))"
               done
-              echo "::error::hint: leave susfs_commit empty so the SUSFS branch tip matches the KernelSU branch tip"
+              echo "::error::hint: leave susfs_commit empty (branch tip), or pin the KernelSU/SUSFS pair together"
               exit 1
             fi
-            echo "OK   every SUSFS call in KernelSU-Next is declared by the installed SUSFS headers"
+            echo "OK   every SUSFS call in KernelSU-Next resolves to the installed SUSFS or to the fork itself"
           fi
 
       # ------------------------------------------------------------------- 7. config
