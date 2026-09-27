@@ -69,9 +69,9 @@ on:
         required: true
         default: 'gki-android16-6.12'
       susfs_commit:
-        description: 'Pin susfs4ksu to this commit (empty = branch tip). The default is the commit WildKernels build their android16-6.12 kernels from.'
+        description: 'Pin susfs4ksu to this commit. Leave EMPTY to use the branch tip, which is what matches the KernelSU dev-susfs tip. (The old default 75a613850178234c6c7595d1db8211716a011a2e, taken from WildKernels commits.json, predates the susfs_is_current_proc_no_su / susfs_set_current_proc_no_su API that dev-susfs calls, so the build dies with "call to undeclared function".)'
         required: false
-        default: '75a613850178234c6c7595d1db8211716a011a2e'
+        default: ''
       os_patch_level:
         description: 'Device security patch level (YYYY-MM). Used for the kernel build timestamp and the docs/summary.'
         required: true
@@ -461,11 +461,21 @@ jobs:
           # ------------------------------------------- pre-patch fixups (see comment above)
           SUB=$(grep '^SUBLEVEL = ' Makefile | awk '{print $3}')
           echo "patching tree at sublevel $SUB"
-          if [ "$SUB" -ge 58 ]; then
-            echo "  [>=58] dropping the already-present #include <linux/dma-buf.h> from fs/exec.c"
+          # RUN #7 LESSON: this block used to delete the stock `#include <linux/dma-buf.h>` from
+          # fs/exec.c unconditionally, on the theory that the SUSFS patch adds it too. On this tree
+          # it does NOT - the pinned and the tip patch both contain zero "dma-buf" strings - while
+          # stock 6.12 fs/exec.c needs that include for dma_buf_begin_new_exec()/get_dmabuf_info().
+          # Deleting it cost a 30-minute build ending in:
+          #   fs/exec.c:1280: error: call to undeclared function 'dma_buf_begin_new_exec'
+          #   fs/exec.c:1313: error: call to undeclared function 'get_dmabuf_info'
+          # Only strip it if the patch really adds the include (a duplicate would reject instead).
+          if grep -q '^+#include <linux/dma-buf.h>' "$PATCH"; then
+            echo "  [fixup] the patch adds <linux/dma-buf.h> - dropping the stock one from fs/exec.c to avoid a duplicate"
             sed -i '/^#include <linux\/dma-buf.h>$/d' fs/exec.c
-            grep -n 'dma-buf' fs/exec.c || echo "  (no dma-buf include left in fs/exec.c - expected)"
+          else
+            echo "  [fixup] the patch does not touch <linux/dma-buf.h> - leaving the stock include in fs/exec.c"
           fi
+          echo "  stock dma-buf includes now in fs/exec.c: $(grep -c '^#include <linux/dma-buf.h>' fs/exec.c || true)"
           if [ "$SUB" -ge 69 ]; then
             echo "  [>=69] fs/proc/task_mmu.c: vma_data_pages -> vma_pages"
             sed -i 's/vma_data_pages/vma_pages/g' fs/proc/task_mmu.c
@@ -506,6 +516,37 @@ jobs:
             echo "OK  $f"
           done
           grep -n 'susfs_init' fs/susfs.c | head -3
+
+          # RUN #7 LESSON (the second compile error): KernelSU-Next's dev-susfs tree calls SUSFS
+          # entry points that only exist in newer SUSFS. With an old SUSFS commit pinned the build
+          # died 30 minutes in with:
+          #   drivers/kernelsu/feature/sucompat.c:199: error: call to undeclared function 'susfs_is_current_proc_no_su'
+          #   drivers/kernelsu/feature/sucompat.c:202: error: call to undeclared function 'susfs_set_current_proc_no_su'
+          # Both exist in the SUSFS branch TIP's susfs_def.h (verified) but not in 75a61385. So:
+          # take every susfs_*() call the KernelSU tree makes and require the SUSFS headers we just
+          # installed to declare all of them. One second of work, no long build wasted, and it is
+          # not fooled by a version string.
+          KSU_TREE="$GITHUB_WORKSPACE/kernel/KernelSU-Next/kernel"
+          if [ -d "$KSU_TREE" ]; then
+            SYMS=$(grep -rhoE '\bsusfs_[a-z0-9_]+\(' "$KSU_TREE" --include='*.c' --include='*.h' 2>/dev/null \
+                   | tr -d '(' | sort -u || true)
+            MISSING=""
+            for sym in $SYMS; do
+              if ! grep -qE "\b${sym}\b" include/linux/susfs.h include/linux/susfs_def.h; then
+                MISSING="$MISSING $sym"
+              fi
+            done
+            echo "SUSFS symbols called by KernelSU-Next: $(echo $SYMS | wc -w)    undeclared by the installed SUSFS: $(echo $MISSING | wc -w)"
+            if [ -n "${MISSING// /}" ]; then
+              echo "::error::the pinned/installed SUSFS is too old for this KernelSU-Next ref"
+              for sym in $MISSING; do
+                echo "::error::  undeclared: $sym  (called from $(grep -rlE "\b${sym}\(" "$KSU_TREE" | head -1))"
+              done
+              echo "::error::hint: leave susfs_commit empty so the SUSFS branch tip matches the KernelSU branch tip"
+              exit 1
+            fi
+            echo "OK   every SUSFS call in KernelSU-Next is declared by the installed SUSFS headers"
+          fi
 
       # ------------------------------------------------------------------- 7. config
       # The canonical list lives in .github/scripts/kodiak/susfs.config (same file the phone-2a
