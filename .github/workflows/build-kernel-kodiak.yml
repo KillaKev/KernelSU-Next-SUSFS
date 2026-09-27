@@ -519,11 +519,23 @@ jobs:
           DEFCONFIG="arch/arm64/configs/gki_defconfig"
           PATCHES="${{ inputs.patches }}"
 
+          # Trim with parameter expansion, NOT `xargs`: run #5 died here after applying 11 keys
+          # because xargs parses quotes, and this config's header comment contains the literal
+          # text  \"strings /vendor/lib/modules/*.ko | grep -m1 vermagic=\"  - that unmatched quote
+          # makes xargs exit 1, which `bash -e` turns into a dead step with no error of ours.
+          # Only lines that really look like CONFIG_* assignments are applied; the rest is skipped
+          # out loud, so prose and device evidence in the file can never break the build again.
           apply_line() {
             local line key value
-            line="$(echo "$1" | xargs)"
-            [ -z "$line" ] && return
-            case "$line" in \#*) return ;; esac
+            line="$1"
+            line="${line#"${line%%[![:space:]]*}"}"
+            line="${line%"${line##*[![:space:]]}"}"
+            [ -z "$line" ] && return 0
+            case "$line" in
+              \#*) return 0 ;;
+              CONFIG_*) ;;
+              *) echo "  skip (not an assignment): $line"; return 0 ;;
+            esac
             if [[ "$line" == *"="* ]]; then key="${line%%=*}"; value="${line#*=}"; else key="$line"; value="y"; fi
             if grep -q "^$key=" "$DEFCONFIG"; then
               sed -i "s|^$key=.*|$key=$value|g" "$DEFCONFIG"
@@ -533,12 +545,14 @@ jobs:
               echo "$key=$value" >> "$DEFCONFIG"
             fi
             echo "  $key=$value"
+            return 0
           }
 
           if [ "$PATCHES" = "ksu-susfs" ]; then
             echo "--- applying .github/scripts/kodiak/susfs.config ---"
-            while IFS= read -r line || [ -n "$line" ]; do apply_line "$line"; done \
-              < "$GITHUB_WORKSPACE/.github/scripts/kodiak/susfs.config"
+            while IFS= read -r line || [ -n "$line" ]; do
+              apply_line "$line" || { echo "::error::could not apply config line: [$line]"; exit 1; }
+            done < "$GITHUB_WORKSPACE/.github/scripts/kodiak/susfs.config"
           elif [ "$PATCHES" = "ksun-only" ]; then
             echo "--- KernelSU only (SUSFS deliberately off) ---"
             apply_line "CONFIG_KSU=y"
