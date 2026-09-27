@@ -141,6 +141,11 @@ jobs:
           echo "================= AFTER =================="
           df -h / /mnt 2>/dev/null || df -h
 
+          # The artifact name is exported in this, the FIRST step, so the always-run summary still
+          # has a name when a later step fails and the rest are skipped (run #1's summary printed
+          # "-AnyKernel3.zip" for exactly that reason). It is set before the gate below on purpose.
+          echo "FILE_NAME=kodiak-6.12.${{ inputs.expected_sublevel }}-${{ inputs.os_patch_level }}-${{ inputs.patches }}" >> "$GITHUB_ENV"
+
           AVAIL_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
           echo "root filesystem has ${AVAIL_GB}GB free"
           if [ "${AVAIL_GB:-0}" -lt 45 ]; then
@@ -149,17 +154,48 @@ jobs:
           fi
 
       # ------------------------------------------------------------- 2. swap headroom
-      # No third-party action (same reasoning as the phone-2a pipeline): plain swapfile.
-      # kleaf/clang + lld can spike well past the 16GB of RAM on a shared runner, and an
-      # OOM kill mid-compile looks exactly like a mystery failure.
-      - name: Add swap
+      # LESSON FROM RUN #1: this step killed the job in 2 minutes with
+      #     fallocate: fallocate failed: Text file busy
+      #     dd: failed to open '/swapfile': Text file busy
+      # because GitHub's ubuntu-latest image ALREADY HAS /swapfile active - the file is open, so
+      # it cannot be created or written. Two corrections:
+      #   * if swap is already on, do nothing and say so;
+      #   * otherwise try a free path on a real filesystem, and never fail the job over it.
+      # Swap is head-room here, not a requirement: this build uses kleaf --config=fast (no LTO),
+      # so the 16 GB of RAM is normally enough and an OOM is the only thing that would miss it.
+      - name: Add swap (best effort)
         run: |
-          sudo fallocate -l 16G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=16384
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
-          swapon --show
-          free -h
+          set -o pipefail
+          echo "---- swap BEFORE ----"
+          swapon --show || true
+          free -h || true
+
+          if swapon --show | grep -q .; then
+            echo "swap is already active on this runner - nothing to add"
+          else
+            enabled=""
+            for dir in /mnt /var/tmp /tmp; do
+              [ -d "$dir" ] || continue
+              f="$dir/swapfile-kodiak"
+              echo "---- trying $f ----"
+              if sudo fallocate -l 8G "$f" 2>/dev/null || sudo dd if=/dev/zero of="$f" bs=1M count=8192 2>/dev/null; then
+                sudo chmod 600 "$f"
+                if sudo mkswap "$f" >/dev/null 2>&1 && sudo swapon "$f" 2>/dev/null; then
+                  echo "swap enabled at $f"
+                  enabled="$f"
+                  break
+                fi
+                sudo rm -f "$f"
+              fi
+            done
+            if [ -z "$enabled" ]; then
+              echo "::warning::could not enable extra swap - continuing anyway (the build uses --config=fast, so no full-LTO memory spike)"
+            fi
+          fi
+
+          echo "---- swap AFTER ----"
+          swapon --show || true
+          free -h || true
 
       # ------------------------------------------------- 3. kernel source (manifest)
       # Google's kernel is a multi-repo tree (common + build + prebuilts), so `repo` - not a
@@ -262,10 +298,6 @@ jobs:
           else
             echo "::warning::os_patch_level '$OS_PATCH_LEVEL_INPUT' is not YYYY-MM - leaving the build clock alone"
           fi
-
-          # The artifact name is fixed HERE, not in the packaging step, because the optional
-          # boot.img step runs earlier and must not invent its own copy of it.
-          echo "FILE_NAME=kodiak-6.12.${{ inputs.expected_sublevel }}-${{ inputs.os_patch_level }}-${{ inputs.patches }}" >> "$GITHUB_ENV"
 
       # ------------------------------------------------------- 5. KernelSU-Next (root)
       # Integration is done by KernelSU-Next's OWN installer (kernel/setup.sh), which is what
@@ -757,6 +789,9 @@ jobs:
       - name: Run summary
         if: ${{ always() }}
         run: |
+          # Fallback: if the run died before the first step exported a name, do not print empty
+          # artifact names (run #1 did, and the summary looked broken).
+          FILE_NAME="${FILE_NAME:-kodiak-build-did-not-get-far-enough-to-name-artifacts}"
           {
             echo "## kodiak GKI kernel - ${{ inputs.patches }}"
             echo
