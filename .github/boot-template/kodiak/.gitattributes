@@ -1,0 +1,8 @@
+# The kodiak reference headers are raw binary and must stay BYTE-EXACT.
+#
+# The repo's own .gitattributes marks `.github/boot-template/*.bin` as binary, but that glob
+# does not cross the '/' into this subdirectory, so without this file git on a Windows box
+# (core.autocrlf=true) may treat them as text and rewrite CRLF sequences. They are the 4 KB
+# header dumps that verify_boot_img.py compares against, so any rewrite silently changes the
+# thing the build is verified against.
+.github/boot-template/kodiak/*.bin binary

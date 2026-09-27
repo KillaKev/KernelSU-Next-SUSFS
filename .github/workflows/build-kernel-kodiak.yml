@@ -1,0 +1,798 @@
+name: Build GKI kernel (KernelSU-Next + SUSFS) - Pixel 11 Pro XL / kodiak
+
+# =============================================================================
+# WHAT THIS BUILDS
+#   A GKI kernel for the Pixel 11 Pro XL (**kodiak**, Tensor G6) from Google's own
+#   android16-6.12 KMI line, with KernelSU-Next + SUSFS compiled in, packaged as an
+#   AnyKernel3 zip (flashed with KernelFlasher on the phone) plus the raw
+#   Image / Image.lz4 for the manual MagiskBoot route.
+#
+# WHY android16-6.12 AND NOT android17-6.18  (this is the whole ball game)
+#   The device runs Android 17 (CD1A.260905.001.B1) but its KERNEL is 6.12, not 6.18:
+#
+#     $ adb shell uname -r
+#     6.12.69-android16-9-g84174099
+#     $ adb shell su -c "strings /vendor/lib/modules/*.ko | grep -m1 vermagic="
+#     vermagic=6.12.69-android16-6-g6a49175400c0-ab16238327-4k SMP preempt mod_unload modversions aarch64
+#     $ adb shell su -c "ls /vendor/lib/modules | wc -l"
+#     128
+#
+#   Those 128 modules are prebuilt by Google and were compiled against the
+#   **android16-6.12** KMI (that "-ab16238327" is this exact build). With
+#   CONFIG_MODVERSIONS=y the kernel compares symbol CRCs, and those CRCs are frozen
+#   per KMI generation - so the kernel MUST come from android16-6.12. Building from
+#   android17-6.18 (ACK's 6.18 line, i.e. what "Android 17" uses upstream) would give
+#   different CRCs and every vendor module would refuse to load: dead Wi-Fi/camera/audio.
+#
+#   Branch naming, read off kernel/manifest (+refs):
+#     common-android16-6.12-2026-03   <- SUBLEVEL 69 == what the device runs today
+#     common-android16-6.12-2026-06   6.12.81
+#     common-android16-6.12-2026-09   newest dated release of this KMI line
+#     common-android16-6.12-lts       moving target
+#   Any of them is CRC-safe (same KMI). 2026-03 is the default because it reproduces
+#   the sublevel the phone actually boots - the least surprising thing to flash.
+#
+# WHY IT LOOKS STOCK-ISH: we do NOT invent a release string. kleaf --config=stamp
+#   derives it from SCM, and step "Kill -dirty/-maybe-dirty" removes the suffix kleaf
+#   would otherwise add, so UTS_RELEASE stays a clean 6.12.69-android16-<n>-g<hash>
+#   (the Wild Kernel currently on the phone reads 6.12.69-android16-9-g84174099).
+#
+# A note on refs: SUSFS lives on GITLAB (gitlab.com/simonpunk/susfs4ksu), not GitHub,
+#   and its patches target a specific KernelSU. We therefore use the SUSFS fork of
+#   KernelSU-Next (pershoot/KernelSU-Next, branch dev-susfs) where SUSFS is already
+#   integrated, and only apply SUSFS's KERNEL-side patch - never its
+#   kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch, which targets upstream
+#   tiann/KernelSU and only produces rejects here.
+# =============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_branch:
+        description: 'ACK branch under kernel/manifest (official name: common-<android>-<kver>-<date>). Default = 6.12.69, the sublevel the phone runs today.'
+        required: true
+        default: 'common-android16-6.12-2026-03'
+      expected_sublevel:
+        description: 'GATE: Makefile SUBLEVEL of the synced tree must equal this (69 == kodiak stock 6.12.69). Set empty to skip the gate.'
+        required: false
+        default: '69'
+      ksu_repo:
+        description: 'KernelSU-Next fork carrying SUSFS (its kernel/setup.sh is used as the integrator).'
+        required: true
+        default: 'https://github.com/pershoot/KernelSU-Next.git'
+      ksu_branch:
+        description: 'KernelSU-Next branch/tag. dev-susfs = the SUSFS-carrying branch.'
+        required: true
+        default: 'dev-susfs'
+      susfs_branch:
+        description: 'susfs4ksu branch on GitLab. Must carry a *android16-6.12* kernel patch.'
+        required: true
+        default: 'gki-android16-6.12'
+      susfs_commit:
+        description: 'Pin susfs4ksu to this commit (empty = branch tip). The default is the commit WildKernels build their android16-6.12 kernels from.'
+        required: false
+        default: '75a613850178234c6c7595d1db8211716a011a2e'
+      os_patch_level:
+        description: 'Device security patch level (YYYY-MM). Used for the kernel build timestamp and the docs/summary.'
+        required: true
+        default: '2026-09'
+      patches:
+        description: 'What to integrate. ksu-susfs = the real build. ksun-only = KernelSU-Next without SUSFS. none = VANILLA CONTROL (same tree, same defconfig, no KernelSU/SUSFS at all).'
+        required: true
+        default: 'ksu-susfs'
+        type: choice
+        options:
+          - ksu-susfs
+          - ksun-only
+          - none
+      bypass_module_versions:
+        description: 'LAST RESORT: also build a second Image with the module-version check neutered (kernel/module/version.c bad_version: return 0 -> return 1). Only useful if the stock vendor modules reject the kernel.'
+        required: true
+        default: false
+        type: boolean
+      boot_img:
+        description: 'Also produce a boot.img for fastboot flash. none = AnyKernel3 only; plain = mkbootimg header v4 (nothing else - that IS the stock layout); avb = the same image plus an AVB hash footer sized to the boot partition.'
+        required: true
+        default: 'plain'
+        type: choice
+        options:
+          - none
+          - plain
+          - avb
+      avb_partition_size:
+        description: 'boot partition size in bytes, used only for boot_img=avb. kodiak boot_a and boot_b are exactly 67108864 (64 MiB) - verified with blockdev --getsize64 on the device.'
+        required: false
+        default: '67108864'
+      bootimg_os_version:
+        description: 'Optional: mkbootimg --os_version. LEAVE EMPTY. Google''s own factory boot.img for this build (kodiak-cd1a.260905.001.b1) has os_version = 0 - it is only init_boot.img that carries 17.0.0. Setting this would make the header differ from stock and the verifier will fail the run.'
+        required: false
+        default: ''
+      bootimg_os_patch_level:
+        description: 'Optional: mkbootimg --os_patch_level. LEAVE EMPTY for the same reason (stock boot.img has patch level 0; stock init_boot has 2026-09).'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 200
+
+    steps:
+      - name: Checkout this repo (workflow + scripts)
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------------------ 1. disk
+      # A kleaf kernel build is disk-hungry, and the stock ubuntu-latest image leaves /
+      # nearly full - the runner can die with "No space left on device" while writing its
+      # OWN diagnostic log (seen on the phone-2a pipeline). Reclaim first, then assert.
+      - name: Free disk space
+        run: |
+          echo "================= BEFORE =================="
+          df -h / /mnt 2>/dev/null || df -h
+
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache /usr/local/share/boost \
+                      /usr/share/swift /usr/lib/jvm /usr/local/lib/node_modules \
+                      /opt/az /usr/local/aws-cli /usr/local/aws-sam-cli \
+                      /usr/share/gradle /usr/share/miniconda 2>/dev/null || true
+          sudo apt-get -qq clean || true
+          sudo rm -rf /var/lib/apt/lists/* || true
+
+          echo "================= AFTER =================="
+          df -h / /mnt 2>/dev/null || df -h
+
+          AVAIL_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "root filesystem has ${AVAIL_GB}GB free"
+          if [ "${AVAIL_GB:-0}" -lt 45 ]; then
+            echo "::error::only ${AVAIL_GB}GB free on / - a kleaf build needs ~45GB+; refusing to burn 3h on a run that will ENOSPC"
+            exit 1
+          fi
+
+      # ------------------------------------------------------------- 2. swap headroom
+      # No third-party action (same reasoning as the phone-2a pipeline): plain swapfile.
+      # kleaf/clang + lld can spike well past the 16GB of RAM on a shared runner, and an
+      # OOM kill mid-compile looks exactly like a mystery failure.
+      - name: Add swap
+        run: |
+          sudo fallocate -l 16G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=16384
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          swapon --show
+          free -h
+
+      # ------------------------------------------------- 3. kernel source (manifest)
+      # Google's kernel is a multi-repo tree (common + build + prebuilts), so `repo` - not a
+      # plain git clone - is what kleaf expects. The manifest branch is the ACK branch, and
+      # init was already done above in the workspace, so the tree lands in ./kernel.
+      - name: Fetch the kernel source (repo init + sync)
+        run: |
+          set -o pipefail
+          mkdir -p "$GITHUB_WORKSPACE/git-repo"
+          curl -L https://storage.googleapis.com/git-repo-downloads/repo -o "$GITHUB_WORKSPACE/git-repo/repo"
+          chmod +x "$GITHUB_WORKSPACE/git-repo/repo"
+          export PATH="$GITHUB_WORKSPACE/git-repo:$PATH"
+          git config --global user.name  "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          BRANCH="${{ inputs.kernel_branch }}"
+          echo "ACK branch requested: $BRANCH"
+
+          # Does the branch exist? ACK renames/retires branches, and a typo here otherwise shows
+          # up as a confusing repo-init error 10 minutes later.
+          if ! git ls-remote https://android.googlesource.com/kernel/common "$BRANCH" | grep -q .; then
+            echo "::error::branch $BRANCH does not exist in kernel/common"
+            echo "---- branches matching this KMI line ----"
+            git ls-remote --heads https://android.googlesource.com/kernel/common \
+              | awk '{print $2}' | sed 's#refs/heads/##' \
+              | grep -E '^common-android1[567]-(6\.12|6\.18)' | sort || true
+            exit 1
+          fi
+
+          mkdir -p "$GITHUB_WORKSPACE/kernel"
+          cd "$GITHUB_WORKSPACE/kernel"
+
+          repo init -u https://android.googlesource.com/kernel/manifest -b "$BRANCH" --depth=1
+          # -c / --current-branch keeps only the single branch we asked for. Retry: the sync pulls
+          # tens of GB from googlesource and a transient 5xx is common.
+          n=0
+          until [ "$n" -ge 3 ]; do
+            n=$((n+1))
+            echo "repo sync attempt $n/3"
+            if repo sync -c --current-branch --no-clone-bundle --no-tags --jobs-checkout=4 -j4; then
+              break
+            fi
+            if [ "$n" -ge 3 ]; then echo "::error::repo sync failed 3x"; exit 1; fi
+            rm -rf .repo/manifests .repo/manifest.xml 2>/dev/null || true
+            sleep 20
+          done
+
+          echo "---- tree ----"
+          ls -la
+          echo "---- common/ present? ----"
+          ls -la common/Makefile common/arch/arm64/configs/gki_defconfig
+
+      # The single cheapest guard in the whole pipeline: if the sublevel in the tree is not the
+      # one we think we synced, everything downstream (release string, "does it look stock") is
+      # wrong - and we would only find out after a 2h build + a flash.
+      - name: Gate - pinned sublevel, KMI sanity
+        run: |
+          set -o pipefail
+          MF="$GITHUB_WORKSPACE/kernel/common/Makefile"
+          V=$(grep '^VERSION = '    "$MF" | awk '{print $3}')
+          P=$(grep '^PATCHLEVEL = ' "$MF" | awk '{print $3}')
+          S=$(grep '^SUBLEVEL = '   "$MF" | awk '{print $3}')
+          echo "tree says: $V.$P.$S   (branch ${{ inputs.kernel_branch }})"
+
+          if [ "$V.$P" != "6.12" ]; then
+            echo "::error::this workflow is only valid for the 6.12 KMI line - got $V.$P"
+            exit 1
+          fi
+          WANT="${{ inputs.expected_sublevel }}"
+          if [ -n "$WANT" ] && [ "$S" != "$WANT" ]; then
+            echo "::error::sublevel $S != expected $WANT - you are on a different dated branch of the KMI line"
+            echo "  (CRCs would still match, but the release string would not be the one this repo pins)"
+            exit 1
+          fi
+          echo "OK   $V.$P.$S on the android16-6.12 KMI line"
+          # gki_defconfig must exist: it is the file we patch in step 6.
+          test -f "$GITHUB_WORKSPACE/kernel/common/arch/arm64/configs/gki_defconfig" \
+            || { echo "::error::common/arch/arm64/configs/gki_defconfig missing"; exit 1; }
+
+      # ----------------------------------------------------- 4. reproducible timestamp
+      # Same trick WildKernels use: pin the build clock to the device's own patch level
+      # (5th of that month, 04:20 UTC). Two reasons - byte-identical rebuilds, and a kernel
+      # whose build date is not "today" but the release it belongs to.
+      - name: Pin the build timestamp
+        run: |
+          set -o pipefail
+          OS_PATCH_LEVEL_INPUT="${{ inputs.os_patch_level }}"
+          if [[ "$OS_PATCH_LEVEL_INPUT" =~ ^([0-9]{4})-([0-9]{2})$ ]]; then
+            FIXED_BUILD_DATE="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-05 04:20:00 UTC"
+            SOURCE_DATE_EPOCH=$(date -u -d "$FIXED_BUILD_DATE" +%s)
+            KBUILD_TS=$(date -u -d @${SOURCE_DATE_EPOCH} '+%a %b %d %H:%M:%S UTC %Y')
+            GIT_DATE=$(date -u -d @${SOURCE_DATE_EPOCH} '+%Y-%m-%dT%H:%M:%SZ')
+            {
+              echo "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH"
+              echo "KBUILD_BUILD_TIMESTAMP=$KBUILD_TS"
+              echo "GIT_COMMITTER_DATE=$GIT_DATE"
+              echo "GIT_AUTHOR_DATE=$GIT_DATE"
+            } >> "$GITHUB_ENV"
+            echo "build clock pinned to: $(date -u -d @${SOURCE_DATE_EPOCH} '+%Y-%m-%d %H:%M:%S UTC') (epoch $SOURCE_DATE_EPOCH)"
+          else
+            echo "::warning::os_patch_level '$OS_PATCH_LEVEL_INPUT' is not YYYY-MM - leaving the build clock alone"
+          fi
+
+          # The artifact name is fixed HERE, not in the packaging step, because the optional
+          # boot.img step runs earlier and must not invent its own copy of it.
+          echo "FILE_NAME=kodiak-6.12.${{ inputs.expected_sublevel }}-${{ inputs.os_patch_level }}-${{ inputs.patches }}" >> "$GITHUB_ENV"
+
+      # ------------------------------------------------------- 5. KernelSU-Next (root)
+      # Integration is done by KernelSU-Next's OWN installer (kernel/setup.sh), which is what
+      # makes drivers/kernelsu + the Kconfig/Makefile wiring appear in common/. Its setup.sh
+      # hardcodes its fork owner, so only that URL is passed - the tree wiring is untouched.
+      #
+      # DO NOT apply susfs4ksu's kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch here.
+      # That patch targets UPSTREAM tiann/KernelSU; against this fork it rejects ~10 hunks
+      # (kernel/Kbuild, core/init.c, feature/sucompat.c, hook/setuid_hook.c, supercall/*,
+      # feature/kernel_umount.c) and every one is load-bearing. A Kconfig grep once made that
+      # look "green" on the phone-2a pipeline and burned hours. The fork already has SUSFS.
+      - name: KernelSU-Next - install into common/
+        if: ${{ inputs.patches != 'none' }}
+        run: |
+          set -o pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+
+          KSU_REPO="${{ inputs.ksu_repo }}"
+          KSU_REF="${{ inputs.ksu_branch }}"
+          echo "KernelSU-Next: $KSU_REPO @ $KSU_REF"
+
+          # setup.sh must come from the very ref we want, otherwise the checkout below is a
+          # different tree than the one the integrator wired in.
+          curl -LSs "${KSU_REPO%.git}/raw/$KSU_REF/kernel/setup.sh" | bash -s "$KSU_REF" || {
+            echo "::warning::raw/$KSU_REF/setup.sh not fetchable - falling back to the fork's dev-susfs URL"
+            curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/dev-susfs/kernel/setup.sh" | bash -s "$KSU_REF"
+          }
+
+          test -d KernelSU-Next/kernel || { echo "::error::setup.sh did not produce KernelSU-Next/kernel"; exit 1; }
+          git -C KernelSU-Next/kernel fetch --depth=50 origin "$KSU_REF" || true
+          git -C KernelSU-Next/kernel checkout "origin/$KSU_REF" 2>/dev/null || git -C KernelSU-Next/kernel checkout "$KSU_REF"
+
+          # Version stamping, exactly as KernelSU-Next does it upstream: the manager compares
+          # these fallbacks with its own API. Without this the manager reports a bogus version.
+          cd KernelSU-Next/kernel
+          COMMITS_COUNT=$(/usr/bin/git rev-list --count HEAD)
+          KSU_VERSION=$(expr "$COMMITS_COUNT" + 30000)
+          sed -i "s/^KSU_VERSION_FALLBACK := 1$/KSU_VERSION_FALLBACK := ${KSU_VERSION}/"             Kbuild || true
+          KSU_GIT_TAG="$(git describe --tags --abbrev=0 2>/dev/null || echo v0.0.1)"
+          sed -i "s/^KSU_VERSION_TAG_FALLBACK := v0.0.1$/KSU_VERSION_TAG_FALLBACK := ${KSU_GIT_TAG}/" Kbuild || true
+          echo "KSU_COMMIT=$(git rev-parse --short HEAD)"  >> "$GITHUB_ENV"
+          echo "KSU_VERSION=$KSU_VERSION"                  >> "$GITHUB_ENV"
+          echo "KSU_GIT_TAG=$KSU_GIT_TAG"                  >> "$GITHUB_ENV"
+
+          ls -la "$GITHUB_WORKSPACE/kernel/common/KernelSU-Next" | head -20
+
+      # The API contract that must hold before we spend two hours compiling:
+      #   KernelSU side -> does the fork declare the SUSFS options at all?
+      # (all of CONFIG_KSU_SUSFS* is *selected by* that declaration; without it kconfig silently
+      # drops our fragment lines and we would ship a kernel whose SUSFS hooks go nowhere.)
+      - name: Gate - SUSFS is wired into KernelSU-Next
+        if: ${{ inputs.patches == 'ksu-susfs' }}
+        run: |
+          set -o pipefail
+          KC="$GITHUB_WORKSPACE/kernel/common/KernelSU-Next/kernel/Kconfig"
+          test -f "$KC" || { echo "::error::$KC missing - KernelSU integration did not happen"; exit 1; }
+          N=$(grep -c 'KSU_SUSFS' "$KC" || true)
+          echo "KSU_SUSFS occurrences in KernelSU-Next/kernel/Kconfig: $N"
+          if [ "${N:-0}" -eq 0 ]; then
+            echo "::error::this KernelSU-Next ref does NOT carry SUSFS - use the pershoot dev-susfs fork"
+            echo "::error::(upstream KernelSU-Next declares only KSU, KSU_DEBUG, KSU_DISABLE_MANAGER, KSU_DISABLE_POLICY)"
+            exit 1
+          fi
+          grep -nE 'KSU_SUSFS' "$KC" | head -15
+
+      # ------------------------------------------------------------------- 6. SUSFS
+      # SUSFS = susfs4ksu on GITLAB (not GitHub) + a kernel-side patch whose name encodes the
+      # exact kernel line: kernel_patches/50_add_susfs_in_gki-android16-6.12.patch.
+      #
+      # The two `sed` fixups BEFORE the patch are not cosmetic: simonpunk's patch is written
+      # against an older 6.12 and on this sublevel it either fails to apply or produces a
+      # non-building tree without them. Both are lifted from the kernel WildKernels ship for
+      # this exact line (their .github/actions/susfs-patches, android16-6.12 branch):
+      #   * sublevel >= 58 - fs/exec.c already includes <linux/dma-buf.h>, so the hunk that
+      #     adds it has to be neutralised first, or "patch would apply to a different file".
+      #   * sublevel >= 69 - fs/proc/task_mmu.c renamed vma_data_pages -> vma_pages, so the
+      #     OPEN_REDIRECT hunk has to be rewritten to the new name.
+      # The two fixups AFTER the patch cover helpers that only exist on branches carrying
+      # Google's page-size-migration feature (VMA_PAD_START, __fold_filemap_fixup_entry).
+      - name: SUSFS - copy sources and apply the kernel patch
+        if: ${{ inputs.patches == 'ksu-susfs' }}
+        run: |
+          set -o pipefail
+          S="$GITHUB_WORKSPACE/susfs4ksu"
+          BRANCH="${{ inputs.susfs_branch }}"
+          SVER="${BRANCH#gki-}"          # gki-android16-6.12 -> android16-6.12
+          echo "SUSFS branch $BRANCH  (patch suffix: $SVER)"
+
+          if ! git ls-remote --heads https://gitlab.com/simonpunk/susfs4ksu.git "$BRANCH" | grep -q .; then
+            echo "::error::susfs4ksu has no branch $BRANCH"
+            git ls-remote --heads https://gitlab.com/simonpunk/susfs4ksu.git | awk '{print $2}' | sed 's#refs/heads/##' | sort || true
+            exit 1
+          fi
+          git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b "$BRANCH" "$S"
+          if [ -n "${{ inputs.susfs_commit }}" ]; then
+            echo "pinning SUSFS to ${{ inputs.susfs_commit }}"
+            git -C "$S" fetch --depth=50 origin "${{ inputs.susfs_commit }}" || true
+            git -C "$S" checkout "${{ inputs.susfs_commit }}"
+          fi
+          echo "SUSFS commit: $(git -C "$S" rev-parse --short HEAD)"
+          SUSFS_VERSION=$(grep -m1 '#define SUSFS_VERSION' "$S/kernel_patches/include/linux/susfs.h" | awk -F'"' '{print $2}')
+          echo "SUSFS_VERSION=${SUSFS_VERSION:-unknown}" >> "$GITHUB_ENV"
+
+          # ---------------------------------------------------------- mandatory gates
+          PATCH="$S/kernel_patches/50_add_susfs_in_gki-$SVER.patch"
+          if [ ! -f "$PATCH" ]; then
+            echo "::error::missing $PATCH - this SUSFS branch does not target $SVER"
+            ls -la "$S"/kernel_patches/ | head -30
+            exit 1
+          fi
+          ls -la "$S"/kernel_patches/fs/ "$S"/kernel_patches/include/linux/ | head -30
+
+          cd "$GITHUB_WORKSPACE/kernel/common"
+
+          # ------------------------------------------- pre-patch fixups (see comment above)
+          SUB=$(grep '^SUBLEVEL = ' Makefile | awk '{print $3}')
+          echo "patching tree at sublevel $SUB"
+          if [ "$SUB" -ge 58 ]; then
+            echo "  [>=58] dropping the already-present #include <linux/dma-buf.h> from fs/exec.c"
+            sed -i '/^#include <linux\/dma-buf.h>$/d' fs/exec.c
+            grep -n 'dma-buf' fs/exec.c || echo "  (no dma-buf include left in fs/exec.c - expected)"
+          fi
+          if [ "$SUB" -ge 69 ]; then
+            echo "  [>=69] fs/proc/task_mmu.c: vma_data_pages -> vma_pages"
+            sed -i 's/vma_data_pages/vma_pages/g' fs/proc/task_mmu.c
+          fi
+
+          # ------------------------------------------------------------------ apply
+          cp -v "$S"/kernel_patches/fs/*            fs/
+          cp -v "$S"/kernel_patches/include/linux/* include/linux/
+          cp -v "$PATCH" ./
+          echo "---- applying $(basename "$PATCH") ----"
+          patch -p1 --forward -F3 < "$(basename "$PATCH")" || echo "::warning::patch reported rejects - the gate below decides"
+
+          # ------------------------------------------- post-patch fixups (see comment above)
+          if grep -q 'VMA_PAD_START(' fs/proc/task_mmu.c && \
+             ! grep -qE '#include <linux/pgsize_migration(_inline)?\.h>|define VMA_PAD_START' fs/proc/task_mmu.c; then
+            echo "  adding VMA_PAD_START fallback to fs/proc/task_mmu.c"
+            sed -i '1a #ifndef VMA_PAD_START\n#define VMA_PAD_START(vma) ((vma)->vm_end)\n#endif' fs/proc/task_mmu.c
+          fi
+          if grep -q '__fold_filemap_fixup_entry' fs/proc/task_mmu.c && \
+             ! grep -q '#include <linux/page_size_compat.h>' fs/proc/task_mmu.c; then
+            echo "  adding page_size_compat.h include to fs/proc/task_mmu.c"
+            sed -i '/#include <linux\/pkeys.h>/a #include <linux\/page_size_compat.h>' fs/proc/task_mmu.c
+          fi
+
+          # ------------------------------------------------------------- hard gates
+          # No guessing and no auto-repair of rejects: a half-applied SUSFS patch produces a
+          # kernel that compiles and boots but silently does nothing useful. Fail here (2 min)
+          # instead of after the build + flash (3 h).
+          REJS=$(find . -name '*.rej' -not -path './.git/*' | wc -l | tr -dc '0-9')
+          echo ".rej files: $REJS"
+          if [ "${REJS:-0}" -ne 0 ]; then
+            echo "::error::SUSFS patch left $REJS rejects - refusing to build a half-patched SUSFS"
+            find . -name '*.rej' -not -path './.git/*' -exec sh -c 'echo "----- {}"; head -40 "{}"' \;
+            exit 1
+          fi
+          for f in fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h; do
+            test -f "$f" || { echo "::error::expected SUSFS file $f is missing"; exit 1; }
+            echo "OK  $f"
+          done
+          grep -n 'susfs_init' fs/susfs.c | head -3
+
+      # ------------------------------------------------------------------- 7. config
+      # The canonical list lives in .github/scripts/kodiak/susfs.config (same file the phone-2a
+      # pipeline uses) so the options are reviewable in git rather than buried in YAML.
+      # CONFIG_KSU=y is NOT "default y" in this fork's Kconfig, and every CONFIG_KSU_SUSFS_*
+      # line is only *selectable* because dev-susfs declares it - which the gate above proved.
+      - name: Apply the kernel config
+        run: |
+          set -o pipefail
+          cd "$GITHUB_WORKSPACE/kernel/common"
+          DEFCONFIG="arch/arm64/configs/gki_defconfig"
+          PATCHES="${{ inputs.patches }}"
+
+          apply_line() {
+            local line key value
+            line="$(echo "$1" | xargs)"
+            [ -z "$line" ] && return
+            case "$line" in \#*) return ;; esac
+            if [[ "$line" == *"="* ]]; then key="${line%%=*}"; value="${line#*=}"; else key="$line"; value="y"; fi
+            if grep -q "^$key=" "$DEFCONFIG"; then
+              sed -i "s|^$key=.*|$key=$value|g" "$DEFCONFIG"
+            elif grep -q "^# $key is not set" "$DEFCONFIG"; then
+              sed -i "s|^# $key is not set|$key=$value|g" "$DEFCONFIG"
+            else
+              echo "$key=$value" >> "$DEFCONFIG"
+            fi
+            echo "  $key=$value"
+          }
+
+          if [ "$PATCHES" = "ksu-susfs" ]; then
+            echo "--- applying .github/scripts/kodiak/susfs.config ---"
+            while IFS= read -r line || [ -n "$line" ]; do apply_line "$line"; done \
+              < "$GITHUB_WORKSPACE/.github/scripts/kodiak/susfs.config"
+          elif [ "$PATCHES" = "ksun-only" ]; then
+            echo "--- KernelSU only (SUSFS deliberately off) ---"
+            apply_line "CONFIG_KSU=y"
+          else
+            echo "--- VANILLA CONTROL: not touching any KSU option ---"
+          fi
+
+          echo "--- KSU/SUSFS lines now in gki_defconfig ---"
+          grep -nE '^CONFIG_KSU|^# CONFIG_KSU' "$DEFCONFIG" || echo "(none)"
+
+          if [ "$PATCHES" = "ksu-susfs" ]; then
+            grep -qE '^CONFIG_KSU=y' "$DEFCONFIG" || { echo "::error::CONFIG_KSU=y did not land"; exit 1; }
+            WANT=$(grep -cE '^CONFIG_KSU_SUSFS' "$GITHUB_WORKSPACE/.github/scripts/kodiak/susfs.config" | tr -dc '0-9')
+            GOT=$(grep -cE '^CONFIG_KSU_SUSFS' "$DEFCONFIG" | tr -dc '0-9')
+            echo "SUSFS options requested: ${WANT:-0}   present: ${GOT:-0}"
+            [ "${GOT:-0}" -ge "${WANT:-1}" ] || { echo "::error::only $GOT of $WANT SUSFS options landed"; exit 1; }
+          elif [ "$PATCHES" = "none" ]; then
+            # The inverse check: a vanilla control that still carries CONFIG_KSU is not a control.
+            if grep -qE '^CONFIG_(KSU|KSU_SUSFS)' "$DEFCONFIG"; then
+              echo "::error::patches=none but gki_defconfig carries KernelSU/SUSFS options"
+              grep -nE '^CONFIG_(KSU|KSU_SUSFS)' "$DEFCONFIG"; exit 1
+            fi
+            echo "OK   no CONFIG_KSU* in gki_defconfig (as intended for the control build)"
+          fi
+
+      # -------------------------------------------------- 8. get kleaf out of the way
+      # We patch gki_defconfig in place, and kleaf's check_defconfig action exists precisely to
+      # catch that: it regenerates the config and compares, so it would fail the build for doing
+      # the thing we intend to do. `check_defconfig = "disabled"` in common/BUILD.bazel is the
+      # documented way to switch it off (the legacy build.sh path is disabled too, for the same
+      # reason) - exactly what WildKernels do for their 6.12 kernels.
+      - name: Disable kleaf's check_defconfig gate
+        run: |
+          set -o pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+          if [ -f common/build.config.gki ]; then
+            sed -i 's/check_defconfig//' common/build.config.gki
+            echo "build.config.gki: check_defconfig removed"
+          fi
+          if ! grep -q 'check_defconfig = "disabled"' common/BUILD.bazel; then
+            sed -i '/name = "kernel_aarch64",/a\    check_defconfig = "disabled",' common/BUILD.bazel
+          fi
+          grep -n -A3 'name = "kernel_aarch64",' common/BUILD.bazel | head -12
+
+          # KernelSU/SUSFS export extra symbols; the ABI protected-exports list can then fail the
+          # build for "exporting a protected symbol". Drop the list (same as WildKernels).
+          rm -rf common/android/abi_gki_protected_exports_* 2>/dev/null || true
+          perl -pi -e 's/^\s*"protected_exports_list"\s*:\s*"android\/abi_gki_protected_exports_aarch64",\s*$//;' common/BUILD.bazel || true
+
+      # ------------------------------------------------------------ 9. clean the release
+      # With --config=stamp kleaf derives UTS_RELEASE from SCM - that is what we want - but it
+      # exports LOCALVERSION="-maybe-dirty" whenever the tree is dirty, and common/scripts/
+      # setlocalversion adds "-dirty" of its own. On the phone-2a pipeline that produced
+      #     5.15.197-...-maybe-dirty
+      # where stock said "...-ab15063902". The suffix lands in the vermagic and in the string the
+      # device and attestation see, so kill it at the source; then commit the edits so the tree
+      # is clean as well (belt and braces) and assert both.
+      - name: Kill -dirty / -maybe-dirty at the source
+        run: |
+          set -o pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+
+          echo "--- stamp.bzl before ---"
+          grep -n 'stable_scmversion_cmd' build/kernel/kleaf/impl/stamp.bzl || true
+          sed -i "/stable_scmversion_cmd/s/-maybe-dirty//g" build/kernel/kleaf/impl/stamp.bzl
+          sed -i 's/-dirty//' common/scripts/setlocalversion
+          echo "--- stamp.bzl after ---"
+          grep -n 'stable_scmversion_cmd' build/kernel/kleaf/impl/stamp.bzl || true
+
+          git -C common add -A
+          git -C common -c user.name="pixel11-kernel-ci" -c user.email="ci@localhost" \
+              commit -q -m "pixel11-ci: gki_defconfig (KSU/SUSFS) + clean dirty flag" --no-verify \
+              || echo "(nothing to commit)"
+          echo "common HEAD: $(git -C common rev-parse --short HEAD)"
+
+          if grep -rqI -- '-maybe-dirty' build/kernel/kleaf/impl/stamp.bzl common/scripts/setlocalversion 2>/dev/null; then
+            echo "::error::-maybe-dirty survives - the release string would not match the branch"
+            grep -rnI -- '-maybe-dirty' build/kernel/kleaf/impl/stamp.bzl common/scripts/setlocalversion
+            exit 1
+          fi
+          echo "OK   no -maybe-dirty / -dirty left in the SCM version machinery"
+
+      # -------------------------------------------------------------------- 10. build
+      # //common:kernel_aarch64/Image is the whole boot.img payload - the 128 vendor modules are
+      # prebuilt on the device and load by KMI, so a full kernel_aarch64_dist (every GKI module,
+      # tens of GB, hours) is wasted here. Image.lz4 comes from the same invocation: it is the
+      # compressed form the Pixel boot image actually stores.
+      - name: kleaf build (Image + Image.lz4)
+        timeout-minutes: 150
+        run: |
+          set -o pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+          mkdir -p /home/runner/.cache/bazel
+
+          tools/bazel build \
+            --config=fast \
+            --config=stamp \
+            --disk_cache=/home/runner/.cache/bazel \
+            //common:kernel_aarch64/Image \
+            //common:kernel_aarch64/Image.lz4
+
+          echo "================= built outputs ================="
+          ls -la bazel-bin/common/kernel_aarch64/ | head -30
+          for f in Image Image.lz4; do
+            test -f "bazel-bin/common/kernel_aarch64/$f" \
+              || { echo "::error::bazel-bin/common/kernel_aarch64/$f was not produced"; exit 1; }
+          done
+          echo "--- release string carried by the Image ---"
+          strings bazel-bin/common/kernel_aarch64/Image | grep -m1 '^Linux version ' || true
+
+      # Optional second kernel: neuter the module-version check so the kernel accepts modules
+      # whose CRCs do not match (kernel/module/version.c, bad_version: -> return 1). Only built
+      # when the input asks for it - an escape hatch, not the normal path.
+      - name: kleaf build - module-version bypass Image (optional)
+        if: ${{ inputs.bypass_module_versions }}
+        timeout-minutes: 150
+        run: |
+          set -o pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+          T=common/kernel/module/version.c
+          test -f "$T" || { echo "::error::$T not found - the bypass hack needs the 6.12 module split"; exit 1; }
+          sed -i '/bad_version:/{:a;n;/return 0;/{s/return 0;/return 1;/;b};ba}' "$T"
+          grep -A5 'bad_version:' "$T" | grep -q 'return 1;' || { echo "::error::bypass patch did not take"; exit 1; }
+          tools/bazel build --config=fast --config=stamp --disk_cache=/home/runner/.cache/bazel \
+            //common:kernel_aarch64/Image
+          mkdir -p bypass
+          cp bazel-bin/common/kernel_aarch64/Image bypass/Bypass-Image
+          ls -la bypass/
+
+      # ------------------------------------------------------------- 11. verify the Image
+      # Gates that answer "is this actually the kernel we think we built", using only the
+      # artifact itself - the same checks the phone-2a pipeline learned to insist on.
+      - name: Verify the built Image
+        run: |
+          set -o pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+          bash "$GITHUB_WORKSPACE/.github/scripts/kodiak/verify_kernel_image.sh" \
+            "bazel-bin/common/kernel_aarch64/Image" \
+            "6.12.${{ inputs.expected_sublevel }}-android16-" \
+            "${{ inputs.patches }}"
+
+      # ---------------------------------------------- 12. optional boot.img (fastboot)
+      # MEASURED, not inferred. Google's factory image for this exact build
+      # (kodiak-cd1a.260905.001.b1) gives the ground truth for a stock boot.img:
+      #     header_version 4, header_size 1584, kernel_size 20230712, ramdisk_size 0,
+      #     os_version 0 (yes: ZERO), os_version patch level 0, cmdline "", signature_size 0
+      # while the stock **init_boot.img** from the same image carries os_version 0x220001a9
+      # (Android 17.0.0, patch 2026-09) and ramdisk_size 2667913. Android puts the version in
+      # init_boot and leaves boot alone - which is why dumping init_boot (an earlier draft of this
+      # file did exactly that) pointed at the wrong value.
+      #
+      # .github/boot-template/kodiak/stock-header.bin is the first 4 KB of the factory image's
+      # boot.img, so verify_boot_img.py compares our header against Google's byte-for-byte.
+      # kodiak-init_boot-header.bin is kept beside it purely so the difference is visible.
+      #
+      # AVB: the stock header has signature_size 0 and no footer in the header itself; boot_img=avb
+      # adds an avbtool hash footer with a generated test key, sized to the real 64 MiB partition.
+      - name: Build boot.img (optional)
+        if: ${{ inputs.boot_img != 'none' }}
+        run: |
+          set -o pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+          K="bazel-bin/common/kernel_aarch64"
+          test -f "$K/Image.lz4" || { echo "::error::$K/Image.lz4 missing - build first"; exit 1; }
+
+          # mkbootimg.py, unpack_bootimg.py and avbtool all live in this one AOSP repo.
+          if [ ! -d "$GITHUB_WORKSPACE/mkbootimg" ]; then
+            git clone --depth=1 https://android.googlesource.com/platform/system/tools/mkbootimg "$GITHUB_WORKSPACE/mkbootimg"
+          fi
+          MK="$GITHUB_WORKSPACE/mkbootimg"
+          ls "$MK" | head -20
+
+          BOOT="$GITHUB_WORKSPACE/boot.img"
+          rm -f "$BOOT"
+          # Header v4, empty cmdline, no ramdisk, and - measured against Google's own factory image,
+          # not inferred - **no os_version**: stock kodiak boot.img carries os_version 0 and patch
+          # level 0, while stock init_boot.img carries 17.0.0 / 2026-09. So the flags are only passed
+          # if someone deliberately sets the inputs, and the verifier compares the result against
+          # .github/boot-template/kodiak/stock-header.bin either way.
+          # Google's stock boot.img stores the kernel as an lz4 *legacy* frame - first bytes 02 21 4c 18.
+          # That is what the bootloader decompresses, so a gzip or raw payload in a header-v4 image
+          # would flash successfully and then fail to boot. Gate it here (seconds) instead of at the
+          # phone (bricked boot).
+          MAGIC=$(od -An -tx1 -j0 -N4 "$K/Image.lz4" | tr -d ' \n')
+          echo "Image.lz4 magic: ${MAGIC:-<empty>}   (stock boot.img kernel magic: 02214c18)"
+          case "$MAGIC" in
+            02214c18) echo "OK   lz4 legacy - identical format to stock" ;;
+            04224d18) echo "::warning::lz4 *frame* format: bootloaders expect the legacy form (02214c18) - prefer flashing via AnyKernel3, which recompresses on-device" ;;
+            *)        echo "::error::$K/Image.lz4 is not lz4 (magic ${MAGIC:-<empty>}) - a boot.img built from it would not boot"; exit 1 ;;
+          esac
+
+          OS_ARGS=()
+          # NOTE: written as if/fi, not `[ -n ... ] && ...`, because GitHub runs run: blocks with
+          # `bash -e` and a failing test would abort the step - which is exactly what happens on the
+          # default (empty) inputs.
+          if [ -n "${{ inputs.bootimg_os_version }}" ]; then
+            OS_ARGS+=(--os_version "${{ inputs.bootimg_os_version }}")
+          fi
+          if [ -n "${{ inputs.bootimg_os_patch_level }}" ]; then
+            OS_ARGS+=(--os_patch_level "${{ inputs.bootimg_os_patch_level }}")
+          fi
+          if [ "${#OS_ARGS[@]}" -eq 0 ]; then
+            echo "mkbootimg header args: none (reproduces Google's factory boot.img header)"
+          else
+            echo "mkbootimg header args: ${OS_ARGS[*]}  <- deviates from stock; the verifier will judge"
+          fi
+
+          python3 "$MK/mkbootimg.py" \
+            --header_version 4 \
+            --kernel "$K/Image.lz4" \
+            "${OS_ARGS[@]}" \
+            --output "$BOOT"
+          ls -la "$BOOT"
+
+          if [ "${{ inputs.boot_img }}" = "avb" ]; then
+            openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+              -out "$GITHUB_WORKSPACE/testkey_rsa2048.pem" 2>/dev/null
+            python3 "$MK/avbtool" add_hash_footer \
+              --partition_name boot \
+              --partition_size ${{ inputs.avb_partition_size }} \
+              --image "$BOOT" \
+              --algorithm SHA256_RSA2048 \
+              --key "$GITHUB_WORKSPACE/testkey_rsa2048.pem"
+            echo "--- avbtool info_image ---"
+            python3 "$MK/avbtool" info_image --image "$BOOT" | head -25 || true
+          fi
+
+          echo "--- what AOSP's own tool makes of the result ---"
+          python3 "$MK/unpack_bootimg.py" --boot_img "$BOOT" --out "$GITHUB_WORKSPACE/unpacked_boot" || true
+
+          echo "--- header compared against the Google-authored reference (stock init_boot_a) ---"
+          python3 "$GITHUB_WORKSPACE/.github/scripts/kodiak/verify_boot_img.py" \
+            "$BOOT" "$GITHUB_WORKSPACE/.github/boot-template/kodiak/stock-header.bin"
+
+          SIZE=$(stat -c %s "$BOOT")
+          LIMIT=${{ inputs.avb_partition_size }}
+          echo "boot.img size: $SIZE bytes (boot partition: $LIMIT)"
+          if [ "$SIZE" -gt "$LIMIT" ]; then
+            echo "::error::boot.img ($SIZE) is larger than the boot partition ($LIMIT) - fastboot would refuse it"
+            exit 1
+          fi
+
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          cp "$BOOT" "$GITHUB_WORKSPACE/artifacts/${FILE_NAME}-boot.img"
+          ls -la "$GITHUB_WORKSPACE/artifacts"
+
+      # -------------------------------------------------------- 13. package AnyKernel3
+      # Why AnyKernel3 instead of a hand-built boot.img: the Pixel boot header carries the OS
+      # version / patch level / AVB hash footer, and AK3 does the repack ON THE PHONE from the
+      # LIVE boot partition with magiskboot - so the header, the ramdisk and the AVB metadata are
+      # preserved exactly, no test keys, no 64MB partition-size guessing, and it refuses non-6.12
+      # kernels. This is also how the Wild Kernel currently on the phone gets flashed.
+      - name: Package AnyKernel3 zip
+        run: |
+          set -o pipefail
+          FILE_NAME="${FILE_NAME:?FILE_NAME is not set - did the timestamp step run?}"
+
+          A="$GITHUB_WORKSPACE/AnyKernel3"
+          rm -rf "$A"
+          git clone --depth=1 https://github.com/WildKernels/AnyKernel3.git -b gki-2.0 "$A"
+
+          # Their GKI zip ships do.devicecheck=0, i.e. it would cheerfully flash this kernel to
+          # ANY GKI device. This repo only ever builds for kodiak, so turn the check ON and name
+          # the device - a wrong flash (real risk with one phone and two identical-looking zips)
+          # then aborts instead of bootlooping.
+          sed -i 's/^do.devicecheck=0$/do.devicecheck=1/' "$A/anykernel.sh"
+          sed -i 's/^device.name1=$/device.name1=kodiak/'    "$A/anykernel.sh"
+          grep -nE '^do.devicecheck|^device\.name1|^block=' "$A/anykernel.sh"
+
+          K="$GITHUB_WORKSPACE/kernel/bazel-bin/common/kernel_aarch64"
+          cp "$K/Image"     "$A/Image"
+          cp "$K/Image.lz4" "$A/Image.lz4"
+          if [ -f "$GITHUB_WORKSPACE/kernel/bypass/Bypass-Image" ]; then
+            cp "$GITHUB_WORKSPACE/kernel/bypass/Bypass-Image" "$A/Bypass-Image"
+          fi
+          ls -la "$A" | head -25
+
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          ( cd "$A" && zip -r -9 "$GITHUB_WORKSPACE/artifacts/${FILE_NAME}-AnyKernel3.zip" . -x '.git/*' -x '.git' >/dev/null )
+          cp "$K/Image"     "$GITHUB_WORKSPACE/artifacts/${FILE_NAME}-Image"
+          cp "$K/Image.lz4" "$GITHUB_WORKSPACE/artifacts/${FILE_NAME}-Image.lz4"
+          ls -la "$GITHUB_WORKSPACE/artifacts"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.FILE_NAME }}
+          path: |
+            artifacts/*
+          if-no-files-found: error
+          compression-level: 0
+
+      # The summary is the thing you actually read at 2am when the flash goes wrong.
+      - name: Run summary
+        if: ${{ always() }}
+        run: |
+          {
+            echo "## kodiak GKI kernel - ${{ inputs.patches }}"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Device | Pixel 11 Pro XL (**kodiak**, Tensor G6) |"
+            echo "| ACK branch | \`${{ inputs.kernel_branch }}\` |"
+            echo "| KMI | android16-6.12 (sublevel ${{ inputs.expected_sublevel }}) |"
+            echo "| Device patch level | ${{ inputs.os_patch_level }} |"
+            echo "| KernelSU-Next | \`${{ inputs.ksu_branch }}\` @ ${{ env.KSU_COMMIT }} (v${{ env.KSU_VERSION }}, ${{ env.KSU_GIT_TAG }}) |"
+            echo "| SUSFS | \`${{ inputs.susfs_branch }}\` @ ${{ inputs.susfs_commit }} (${{ env.SUSFS_VERSION }}) |"
+            echo "| Artifact | \`${{ env.FILE_NAME }}-AnyKernel3.zip\` (+ \`-Image\`, \`-Image.lz4\`) |"
+            if [ -f "$GITHUB_WORKSPACE/artifacts/${{ env.FILE_NAME }}-boot.img" ]; then
+              echo "| boot.img | \`${{ env.FILE_NAME }}-boot.img\` (mode \`${{ inputs.boot_img }}\`, header checked against the Google-authored init_boot reference) |"
+            fi
+            echo
+            echo "### Flashing (keep the phone rooted and backed up)"
+            echo "1. \`adb shell su -c \"dd if=/dev/block/by-name/boot_a of=/sdcard/boot_a-pre-ci.img\"\` - always have the current boot image."
+            echo "2. Install **${{ env.FILE_NAME }}-AnyKernel3.zip** with KernelFlasher (or any AK3 flasher). It repacks the LIVE boot partition, keeps the header/AVB fields and refuses non-6.12 kernels."
+            echo "3. Reboot, then run the verification checklist in the repo README."
+            if [ -f "$GITHUB_WORKSPACE/artifacts/${{ env.FILE_NAME }}-boot.img" ]; then
+              echo "4. No flasher app, or the phone only reaches fastboot: \`fastboot flash boot ${{ env.FILE_NAME }}-boot.img\`. That image is header v4 with an empty cmdline and \`ramdisk_size 0\` - the stock layout, checked against the dump."
+            fi
+            echo
+            echo "### Manual route, if you cannot use a flasher"
+            echo "\`\`\`"
+            echo "adb push ${{ env.FILE_NAME }}-Image.lz4 /data/local/tmp/"
+            echo "adb shell su -c 'cd /data/local/tmp && magiskboot unpack /dev/block/by-name/boot_a && cp Image.lz4 kernel && magiskboot repack /dev/block/by-name/boot_a new-boot.img && dd if=new-boot.img of=/dev/block/by-name/boot_a'"
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+
+
+
+
+
+
+
+
