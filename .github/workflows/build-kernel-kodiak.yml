@@ -212,17 +212,31 @@ jobs:
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
           BRANCH="${{ inputs.kernel_branch }}"
+          MANIFEST=https://android.googlesource.com/kernel/manifest
+          ACK_COMMON=https://android.googlesource.com/kernel/common
           echo "ACK branch requested: $BRANCH"
 
-          # Does the branch exist? ACK renames/retires branches, and a typo here otherwise shows
-          # up as a confusing repo-init error 10 minutes later.
-          if ! git ls-remote https://android.googlesource.com/kernel/common "$BRANCH" | grep -q .; then
-            echo "::error::branch $BRANCH does not exist in kernel/common"
-            echo "---- branches matching this KMI line ----"
-            git ls-remote --heads https://android.googlesource.com/kernel/common \
+          # LESSON FROM RUN #2: this branch name exists in TWO repos under TWO names.
+          #   repo init -b  ->  kernel/MANIFEST  ->  refs/heads/common-android16-6.12-2026-03
+          #   repo sync     ->  kernel/COMMON    ->  refs/heads/android16-6.12-2026-03   (no "common-" prefix)
+          # Run #2 asked kernel/common for the *manifest* name, found nothing, and aborted after five
+          # minutes with a message that made it look like the branch did not exist at all. So: gate on
+          # the manifest repo (that is what repo init consumes), then report the ACK branch for info.
+          if ! git ls-remote "$MANIFEST" "refs/heads/$BRANCH" | grep -q .; then
+            echo "::error::$BRANCH does not exist in kernel/manifest (the repo repo-init reads)"
+            echo "---- manifest branches for this KMI line ----"
+            git ls-remote --heads "$MANIFEST" \
               | awk '{print $2}' | sed 's#refs/heads/##' \
               | grep -E '^common-android1[567]-(6\.12|6\.18)' | sort || true
             exit 1
+          fi
+          echo "OK   kernel/manifest has refs/heads/$BRANCH"
+
+          ACK_BRANCH="${BRANCH#common-}"
+          if git ls-remote "$ACK_COMMON" "refs/heads/$ACK_BRANCH" | grep -q .; then
+            echo "OK   kernel/common has refs/heads/$ACK_BRANCH (the tree repo sync checks out)"
+          else
+            echo "::warning::kernel/common has no refs/heads/$ACK_BRANCH - the manifest may point elsewhere; repo sync below will say so"
           fi
 
           mkdir -p "$GITHUB_WORKSPACE/kernel"
@@ -394,8 +408,19 @@ jobs:
           git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b "$BRANCH" "$S"
           if [ -n "${{ inputs.susfs_commit }}" ]; then
             echo "pinning SUSFS to ${{ inputs.susfs_commit }}"
-            git -C "$S" fetch --depth=50 origin "${{ inputs.susfs_commit }}" || true
-            git -C "$S" checkout "${{ inputs.susfs_commit }}"
+            # The clone above is --depth=1, so a historical commit is usually absent locally. Try the
+            # cheap fetch first, then deepen, then fall back to full history; and if the checkout still
+            # fails say so clearly instead of letting bash -e print a bare "pathspec" error.
+            if ! git -C "$S" fetch --depth=50 origin "${{ inputs.susfs_commit }}" 2>/dev/null; then
+              echo "shallow fetch of the commit failed - deepening the clone"
+              git -C "$S" fetch --depth=500 origin "$BRANCH" || git -C "$S" fetch --unshallow origin || true
+            fi
+            if ! git -C "$S" checkout "${{ inputs.susfs_commit }}"; then
+              echo "::error::cannot check out SUSFS commit ${{ inputs.susfs_commit }} on branch $BRANCH"
+              git -C "$S" log --oneline -3 || true
+              exit 1
+            fi
+            echo "SUSFS pinned at $(git -C "$S" rev-parse --short HEAD) ($(git -C "$S" log -1 --format=%ci))"
           fi
           echo "SUSFS commit: $(git -C "$S" rev-parse --short HEAD)"
           SUSFS_VERSION=$(grep -m1 '#define SUSFS_VERSION' "$S/kernel_patches/include/linux/susfs.h" | awk -F'"' '{print $2}')
