@@ -733,25 +733,59 @@ jobs:
           # The whole string funnels through common/scripts/setlocalversion (the Makefile's
           # filechk_kernel.release calls it), so forcing that script plus the stamp.bzl fallback
           # pins the release exactly. Asserted here, before a 20-minute build, not after.
+          # ---------------------------------------------------------------------------------------
+          # EVIDENCE FIRST: print how this tree composes the release, and what the pristine script
+          # emits, so the next run's log is self-explanatory instead of guesswork.
+          echo "--- how the release is composed (evidence) ---"
+          grep -n 'filechk_kernel.release' -A2 common/Makefile | head -8 || true
+          grep -n 'KERNELVERSION\|LOCALVERSION' build/kernel/kleaf/impl/*.bzl 2>/dev/null | head -16 || true
+          cp common/scripts/setlocalversion /tmp/setlocalversion.orig 2>/dev/null || true
+          if [ -f /tmp/setlocalversion.orig ]; then
+            echo "pristine setlocalversion emits: '$(sh /tmp/setlocalversion.orig "$GITHUB_WORKSPACE/kernel/common" 2>/dev/null || true)'"
+          fi
+
           EXPECT="${{ inputs.expected_uts_release }}"
           if [ -n "$EXPECT" ]; then
-            SUFFIX=$(printf '%s' "$EXPECT" | sed 's/^[0-9][0-9.]*//')
+            # RUN #16 LESSON: emitting only the suffix produced a kernel whose banner read
+            #   Linux version -android16-6-g6a49175400c0-ab16238327-4k
+            # i.e. whatever this script prints becomes the ENTIRE release - no version is prepended
+            # on this tree. So emit the complete expected string.
             echo "expected UTS_RELEASE : $EXPECT"
-            echo "forced suffix        : $SUFFIX"
-            grep -q 'CI: forced release suffix' common/scripts/setlocalversion || \
-              sed -i "2i echo \"${SUFFIX}\"; exit 0   # CI: forced release suffix" common/scripts/setlocalversion
-            sed -i "s|^stable_scmversion_cmd = \"echo ''\"|stable_scmversion_cmd = \"echo '${SUFFIX}'\"|" \
+            grep -q 'CI: forced release' common/scripts/setlocalversion || \
+              sed -i "2i echo \"${EXPECT}\"; exit 0   # CI: forced release" common/scripts/setlocalversion
+            sed -i "s|^stable_scmversion_cmd = \"echo ''\"|stable_scmversion_cmd = \"echo '${EXPECT}'\"|" \
               build/kernel/kleaf/impl/stamp.bzl
             ABN=$(printf '%s' "$EXPECT" | sed -n 's/.*-ab\([0-9]\+\).*/\1/p')
-            [ -n "$ABN" ] && echo "BUILD_NUMBER=$ABN" >> "$GITHUB_ENV" && echo "pinned BUILD_NUMBER=$ABN"
-            echo "--- common/scripts/setlocalversion, first 4 lines ---"
-            head -4 common/scripts/setlocalversion
+            if [ -n "$ABN" ]; then echo "BUILD_NUMBER=$ABN" >> "$GITHUB_ENV"; echo "pinned BUILD_NUMBER=$ABN"; fi
+            echo "--- common/scripts/setlocalversion, first 3 lines ---"
+            head -3 common/scripts/setlocalversion
             GOT="$(sh common/scripts/setlocalversion "$GITHUB_WORKSPACE/kernel/common" 2>/dev/null || true)"
-            BASE=$(awk -F' = ' '/^VERSION = /{v=$2} /^PATCHLEVEL = /{p=$2} /^SUBLEVEL = /{s=$2} END{print v"."p"."s}' common/Makefile)
-            echo "setlocalversion emits: '$GOT'"
-            echo "composed UTS_RELEASE will be: ${BASE}${GOT}"
-            [ "$GOT" = "$SUFFIX" ] || { echo "::error::setlocalversion emitted '$GOT', expected '$SUFFIX'"; exit 1; }
-            [ "${BASE}${GOT}" = "$EXPECT" ] || { echo "::error::composed release '${BASE}${GOT}' != expected '$EXPECT'"; exit 1; }
+            echo "forced setlocalversion emits: '$GOT'"
+            [ "$GOT" = "$EXPECT" ] || { echo "::error::setlocalversion emitted '$GOT', expected '$EXPECT'"; exit 1; }
+
+            # CHEAP PROOF (RUN #16 LESSON): re-run kleaf's config-only target - about a minute - and
+            # read the kernel.release it regenerates, instead of discovering the string 20 minutes
+            # into the build. syncconfig runs filechk_kernel.release, so this is the real value.
+            echo "--- regenerating the config so kernel.release reflects the forced string ---"
+            if tools/bazel build --config=fast --config=stamp --disk_cache=/home/runner/.cache/bazel \
+                 //common:kernel_aarch64_config >/tmp/config_verify.log 2>&1; then
+              echo "config target rebuilt OK"
+            else
+              echo "::warning::config rebuild failed - see the tail below; step 14 will also check"
+              tail -20 /tmp/config_verify.log || true
+            fi
+            KR=$(find "$GITHUB_WORKSPACE/kernel/out" -name kernel.release -print -quit 2>/dev/null || true)
+            if [ -n "$KR" ]; then
+              RELEASE=$(cat "$KR")
+              echo "kernel.release at $KR says: '$RELEASE'"
+              if [ "$RELEASE" != "$EXPECT" ]; then
+                echo "::error::this tree will build '$RELEASE', not '$EXPECT' - fix the forcing before the 20-minute build"
+                exit 1
+              fi
+              echo "OK   kernel.release exactly matches the device's stock release"
+            else
+              echo "::warning::no kernel.release found under out/ - relying on step 14's post-build gate"
+            fi
             echo "OK   release string pinned to the device's stock value"
           else
             echo "expected_uts_release empty - release string left to kleaf"
