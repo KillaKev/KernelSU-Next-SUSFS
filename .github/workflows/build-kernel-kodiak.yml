@@ -396,7 +396,7 @@ jobs:
             echo "::error::(upstream KernelSU-Next declares only KSU, KSU_DEBUG, KSU_DISABLE_MANAGER, KSU_DISABLE_POLICY)"
             exit 1
           fi
-          grep -nE 'KSU_SUSFS' "$KC" | head -15
+          grep -nE 'KSU_SUSFS' "$KC" | head -15 || true
 
       # ------------------------------------------------------------------- 6. SUSFS
       # SUSFS = susfs4ksu on GITLAB (not GitHub) + a kernel-side patch whose name encodes the
@@ -451,10 +451,10 @@ jobs:
           PATCH="$S/kernel_patches/50_add_susfs_in_gki-$SVER.patch"
           if [ ! -f "$PATCH" ]; then
             echo "::error::missing $PATCH - this SUSFS branch does not target $SVER"
-            ls -la "$S"/kernel_patches/ | head -30
+            ls -la "$S"/kernel_patches/ | head -30 || true
             exit 1
           fi
-          ls -la "$S"/kernel_patches/fs/ "$S"/kernel_patches/include/linux/ | head -30
+          ls -la "$S"/kernel_patches/fs/ "$S"/kernel_patches/include/linux/ | head -30 || true
 
           cd "$GITHUB_WORKSPACE/kernel/common"
 
@@ -515,7 +515,7 @@ jobs:
             test -f "$f" || { echo "::error::expected SUSFS file $f is missing"; exit 1; }
             echo "OK  $f"
           done
-          grep -n 'susfs_init' fs/susfs.c | head -3
+          grep -n 'susfs_init' fs/susfs.c | head -3 || true
 
           # RUN #7 LESSON (the second compile error): KernelSU-Next's dev-susfs tree calls SUSFS
           # entry points that only exist in newer SUSFS. With an old SUSFS commit pinned the build
@@ -658,7 +658,7 @@ jobs:
           L=$(grep -n '^[[:space:]]*name = "kernel_aarch64",' "$BAZEL" | head -1 | cut -d: -f1)
           if [ -z "${L:-}" ]; then
             echo "::error::cannot find the \"kernel_aarch64\" target in $BAZEL"
-            grep -n 'kernel_aarch64' "$BAZEL" | head -20
+            grep -n 'kernel_aarch64' "$BAZEL" | head -20 || true
             exit 1
           fi
           echo "kernel_build(kernel_aarch64) name line: $BAZEL:$L"
@@ -781,12 +781,15 @@ jobs:
             echo "-- symlinks at the workspace root --"
             ls -la "$GITHUB_WORKSPACE/kernel" | grep -E 'bazel-bin|bazel-out|^l' || true
             echo "-- searching out/ for Image / Image.lz4 --"
-            find "$GITHUB_WORKSPACE/kernel/out" -maxdepth 7 \( -name 'Image' -o -name 'Image.lz4' \) 2>/dev/null | head -20
+            find "$GITHUB_WORKSPACE/kernel/out" -maxdepth 7 \( -name 'Image' -o -name 'Image.lz4' \) 2>/dev/null | head -20 || true
             echo "::error::build succeeded but Image is not at $K (full log is uploaded as an artifact)"
             exit 1
           fi
           echo "================= built outputs ($K) ================="
-          ls -la "$K" | head -30
+          # No `| head` here: RUN #13 LESSON - `ls ... | head -30` gives ls a broken pipe, ls exits 2
+          # and with `set -o pipefail` + `bash -e` that aborts the step after a SUCCESSFUL build. The
+          # listing is a dozen lines, so print it whole.
+          ls -la "$K" || true
           for f in Image Image.lz4; do
             test -s "$K/$f" || { echo "::error::$K/$f missing or empty"; exit 1; }
             echo "OK   $f: $(stat -c%s "$K/$f") bytes"
@@ -870,7 +873,7 @@ jobs:
             git clone --depth=1 https://android.googlesource.com/platform/system/tools/mkbootimg "$GITHUB_WORKSPACE/mkbootimg"
           fi
           MK="$GITHUB_WORKSPACE/mkbootimg"
-          ls "$MK" | head -20
+          ls "$MK" | head -20 || true
 
           BOOT="$GITHUB_WORKSPACE/boot.img"
           rm -f "$BOOT"
@@ -975,7 +978,7 @@ jobs:
           if [ -f "$GITHUB_WORKSPACE/kernel/bypass/Bypass-Image" ]; then
             cp "$GITHUB_WORKSPACE/kernel/bypass/Bypass-Image" "$A/Bypass-Image"
           fi
-          ls -la "$A" | head -25
+          ls -la "$A" | head -25 || true
 
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
           ( cd "$A" && zip -r -9 "$GITHUB_WORKSPACE/artifacts/${FILE_NAME}-AnyKernel3.zip" . -x '.git/*' -x '.git' >/dev/null )
