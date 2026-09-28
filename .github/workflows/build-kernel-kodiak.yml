@@ -742,33 +742,58 @@ jobs:
           cd "$GITHUB_WORKSPACE/kernel"
           mkdir -p /home/runner/.cache/bazel
 
+          # Capture the WHOLE step - the build AND the post-build checks. RUN #10 LESSON: teeing only
+          # the bazel line hid the real failure. The build had actually SUCCEEDED
+          #   INFO: Build completed successfully, 24 total actions
+          #   -- KernelSU-Next version: 33312  -- KernelSU-Next tag: v3.4.0  -- SUSFS_VERSION: v2.3.0
+          # and the step still exited 2 further down, because kleaf keeps its convenience symlinks under
+          # out/ (its output base is out/bazel/...), so `ls bazel-bin/...` referenced a missing path and
+          # ls exits 2. That exit code was the only trace; now the whole step lands in the file.
+          exec > >(tee /tmp/build.log) 2>&1
+
           set +e
           tools/bazel build \
             --config=fast \
             --config=stamp \
             --disk_cache=/home/runner/.cache/bazel \
             //common:kernel_aarch64/Image \
-            //common:kernel_aarch64/Image.lz4 2>&1 | tee /tmp/build.log
-          RC=${PIPESTATUS[0]}
+            //common:kernel_aarch64/Image.lz4
+          RC=$?
           set -e
-          echo "bazel exit code: $RC   (log: /tmp/build.log, $(wc -l < /tmp/build.log || echo 0) lines)"
-          if [ "$RC" -ne 0 ]; then
-            echo "=================== build FAILED - last 80 lines ==================="
-            tail -80 /tmp/build.log || true
-            echo "=================== error-ish lines ==================="
-            grep -nE 'ERROR|error:|\*\*\*|FAILED|undefined' /tmp/build.log | tail -50 || true
-            echo "=================== end of build log ==================="
-          fi
+          echo "bazel exit code: $RC"
           test "$RC" -eq 0 || exit "$RC"
 
-          echo "================= built outputs ================="
-          ls -la bazel-bin/common/kernel_aarch64/ | head -30
+          # Find where kleaf actually put the outputs and recreate the plain `bazel-bin` symlink that the
+          # later steps (bypass / Verify / boot.img / Package) all assume. Never fail on a path guess.
+          KB="$GITHUB_WORKSPACE/kernel/bazel-bin"
+          if [ ! -f "$KB/common/kernel_aarch64/Image" ]; then
+            for cand in "$GITHUB_WORKSPACE/kernel/out/bazel-bin" "$GITHUB_WORKSPACE/kernel/out"; do
+              if [ -f "$cand/common/kernel_aarch64/Image" ]; then
+                echo "kleaf put the outputs in $cand"
+                if [ ! -e "$KB" ]; then ln -s "$cand" "$KB"; echo "created bazel-bin -> $cand"; fi
+                break
+              fi
+            done
+          fi
+          K="$KB/common/kernel_aarch64"
+          if [ ! -f "$K/Image" ]; then
+            echo "================= built outputs ================="
+            echo "-- symlinks at the workspace root --"
+            ls -la "$GITHUB_WORKSPACE/kernel" | grep -E 'bazel-bin|bazel-out|^l' || true
+            echo "-- searching out/ for Image / Image.lz4 --"
+            find "$GITHUB_WORKSPACE/kernel/out" -maxdepth 7 \( -name 'Image' -o -name 'Image.lz4' \) 2>/dev/null | head -20
+            echo "::error::build succeeded but Image is not at $K (full log is uploaded as an artifact)"
+            exit 1
+          fi
+          echo "================= built outputs ($K) ================="
+          ls -la "$K" | head -30
           for f in Image Image.lz4; do
-            test -f "bazel-bin/common/kernel_aarch64/$f" \
-              || { echo "::error::bazel-bin/common/kernel_aarch64/$f was not produced"; exit 1; }
+            test -s "$K/$f" || { echo "::error::$K/$f missing or empty"; exit 1; }
+            echo "OK   $f: $(stat -c%s "$K/$f") bytes"
           done
           echo "--- release string carried by the Image ---"
-          strings bazel-bin/common/kernel_aarch64/Image | grep -m1 '^Linux version ' || true
+          strings "$K/Image" | grep -m1 '^Linux version ' || true
+          echo "KLEAF_OUTDIR=$K" >> "$GITHUB_ENV"
 
       # Optional second kernel: neuter the module-version check so the kernel accepts modules
       # whose CRCs do not match (kernel/module/version.c, bad_version: -> return 1). Only built
