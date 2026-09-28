@@ -72,6 +72,10 @@ on:
         description: 'Pin susfs4ksu to this commit. Leave EMPTY to use the branch tip, which is what matches the KernelSU dev-susfs tip. (The old default 75a613850178234c6c7595d1db8211716a011a2e, taken from WildKernels commits.json, predates the susfs_is_current_proc_no_su / susfs_set_current_proc_no_su API that dev-susfs calls, so the build dies with "call to undeclared function".)'
         required: false
         default: ''
+      expected_uts_release:
+        description: 'GATE: the exact UTS_RELEASE the built Image must report (i.e. uname -r). Default is what the phone ships with, read from its vendor modules: vermagic=6.12.69-android16-6-g6a49175400c0-ab16238327-4k. The workflow forces this suffix into the build (kleaf cannot derive the SCM parts on a runner - it wants the repo tool, and without it stamp.bzl falls back to a literal) and fails fast if the composed release differs. Empty = do not force, do not check.'
+        required: false
+        default: '6.12.69-android16-6-g6a49175400c0-ab16238327-4k'
       os_patch_level:
         description: 'Device security patch level (YYYY-MM). Used for the kernel build timestamp and the docs/summary.'
         required: true
@@ -714,6 +718,46 @@ jobs:
           grep -n 'stable_scmversion_cmd' build/kernel/kleaf/impl/stamp.bzl || true
           sed -i "/stable_scmversion_cmd/s/-maybe-dirty//g" build/kernel/kleaf/impl/stamp.bzl
           sed -i 's/-dirty//' common/scripts/setlocalversion
+
+          # ---------------------------------------------------------------------------------------
+          # FORCE THE EXACT UTS_RELEASE (why the stock vendor modules read
+          #   6.12.69-android16-6-g6a49175400c0-ab16238327-4k   while run #15's kernel read
+          #   6.12.69-android16-6-4k )
+          #
+          # kleaf composes the release as <VERSION.PATCHLEVEL.SUBLEVEL> + <localversion> + <SCM
+          # version> + <page size>. The SCM half is sourced by stamp.bzl, which on a runner cannot
+          # determine it at all ("Unable to execute repo manifest -r: ... 'repo'") and therefore
+          # falls back to the literal '-maybe-dirty' - which is what my sed above neuters, leaving
+          # the -g<hash> and -ab<build> tokens missing.
+          #
+          # The whole string funnels through common/scripts/setlocalversion (the Makefile's
+          # filechk_kernel.release calls it), so forcing that script plus the stamp.bzl fallback
+          # pins the release exactly. Asserted here, before a 20-minute build, not after.
+          EXPECT="${{ inputs.expected_uts_release }}"
+          if [ -n "$EXPECT" ]; then
+            SUFFIX=$(printf '%s' "$EXPECT" | sed 's/^[0-9][0-9.]*//')
+            echo "expected UTS_RELEASE : $EXPECT"
+            echo "forced suffix        : $SUFFIX"
+            grep -q 'CI: forced release suffix' common/scripts/setlocalversion || \
+              sed -i "2i echo \"${SUFFIX}\"; exit 0   # CI: forced release suffix" common/scripts/setlocalversion
+            sed -i "s|^stable_scmversion_cmd = \"echo ''\"|stable_scmversion_cmd = \"echo '${SUFFIX}'\"|" \
+              build/kernel/kleaf/impl/stamp.bzl
+            ABN=$(printf '%s' "$EXPECT" | sed -n 's/.*-ab\([0-9]\+\).*/\1/p')
+            [ -n "$ABN" ] && echo "BUILD_NUMBER=$ABN" >> "$GITHUB_ENV" && echo "pinned BUILD_NUMBER=$ABN"
+            echo "--- common/scripts/setlocalversion, first 4 lines ---"
+            head -4 common/scripts/setlocalversion
+            GOT="$(sh common/scripts/setlocalversion "$GITHUB_WORKSPACE/kernel/common" 2>/dev/null || true)"
+            BASE=$(awk -F' = ' '/^VERSION = /{v=$2} /^PATCHLEVEL = /{p=$2} /^SUBLEVEL = /{s=$2} END{print v"."p"."s}' common/Makefile)
+            echo "setlocalversion emits: '$GOT'"
+            echo "composed UTS_RELEASE will be: ${BASE}${GOT}"
+            [ "$GOT" = "$SUFFIX" ] || { echo "::error::setlocalversion emitted '$GOT', expected '$SUFFIX'"; exit 1; }
+            [ "${BASE}${GOT}" = "$EXPECT" ] || { echo "::error::composed release '${BASE}${GOT}' != expected '$EXPECT'"; exit 1; }
+            echo "OK   release string pinned to the device's stock value"
+          else
+            echo "expected_uts_release empty - release string left to kleaf"
+          fi
+          echo "--- stamp.bzl after ---"
+          grep -n 'stable_scmversion_cmd' build/kernel/kleaf/impl/stamp.bzl || true
           echo "--- stamp.bzl after ---"
           grep -n 'stable_scmversion_cmd' build/kernel/kleaf/impl/stamp.bzl || true
 
@@ -797,6 +841,20 @@ jobs:
           echo "--- release string carried by the Image ---"
           strings "$K/Image" | grep -m1 '^Linux version ' || true
           echo "KLEAF_OUTDIR=$K" >> "$GITHUB_ENV"
+          # GATE: the release string must be byte-identical to what the phone ships, because that is
+          # the value uname -r reports and what attestation-shaped checks read. Step 13 forced it, this
+          # verifies the artifact really carries it.
+          UTS=$(strings "$K/Image" | grep -m1 '^Linux version ' | awk '{print $3}')
+          echo "UTS_RELEASE: '$UTS'"
+          echo "UTS_RELEASE=$UTS" >> "$GITHUB_ENV"
+          EXPECT="${{ inputs.expected_uts_release }}"
+          if [ -n "$EXPECT" ]; then
+            if [ "$UTS" != "$EXPECT" ]; then
+              echo "::error::UTS_RELEASE mismatch - the Image reports '$UTS' but the device expects '$EXPECT'"
+              exit 1
+            fi
+            echo "OK   UTS_RELEASE matches the device's stock string exactly"
+          fi
 
       # Optional second kernel: neuter the module-version check so the kernel accepts modules
       # whose CRCs do not match (kernel/module/version.c, bad_version: -> return 1). Only built
