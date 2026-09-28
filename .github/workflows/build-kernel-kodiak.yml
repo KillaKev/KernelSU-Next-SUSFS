@@ -742,12 +742,24 @@ jobs:
           cd "$GITHUB_WORKSPACE/kernel"
           mkdir -p /home/runner/.cache/bazel
 
+          set +e
           tools/bazel build \
             --config=fast \
             --config=stamp \
             --disk_cache=/home/runner/.cache/bazel \
             //common:kernel_aarch64/Image \
-            //common:kernel_aarch64/Image.lz4
+            //common:kernel_aarch64/Image.lz4 2>&1 | tee /tmp/build.log
+          RC=${PIPESTATUS[0]}
+          set -e
+          echo "bazel exit code: $RC   (log: /tmp/build.log, $(wc -l < /tmp/build.log || echo 0) lines)"
+          if [ "$RC" -ne 0 ]; then
+            echo "=================== build FAILED - last 80 lines ==================="
+            tail -80 /tmp/build.log || true
+            echo "=================== error-ish lines ==================="
+            grep -nE 'ERROR|error:|\*\*\*|FAILED|undefined' /tmp/build.log | tail -50 || true
+            echo "=================== end of build log ==================="
+          fi
+          test "$RC" -eq 0 || exit "$RC"
 
           echo "================= built outputs ================="
           ls -la bazel-bin/common/kernel_aarch64/ | head -30
@@ -761,6 +773,21 @@ jobs:
       # Optional second kernel: neuter the module-version check so the kernel accepts modules
       # whose CRCs do not match (kernel/module/version.c, bad_version: -> return 1). Only built
       # when the input asks for it - an escape hatch, not the normal path.
+      # RUN #9 LESSON: the run's log archive came back as a 25KB stub (0_build.txt + system.txt), so a
+      # 20-minute compile failure left no readable trace - the only evidence was the check-run
+      # annotation "Process completed with exit code 2". Capture the build log and upload it ALWAYS,
+      # so a failure is diagnosable no matter how GitHub truncates the job log.
+      - name: Upload the build log (always)
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.FILE_NAME }}-build-log
+          path: |
+            /tmp/build.log
+            /tmp/config_smoke.log
+          if-no-files-found: ignore
+          compression-level: 9
+
       - name: kleaf build - module-version bypass Image (optional)
         if: ${{ inputs.bypass_module_versions }}
         timeout-minutes: 150
