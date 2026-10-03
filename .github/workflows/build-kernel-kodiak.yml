@@ -61,17 +61,17 @@ on:
         required: true
         default: 'https://github.com/pershoot/KernelSU-Next.git'
       ksu_branch:
-        description: 'KernelSU-Next ref. It MUST be a dev-susfs commit: SUSFS exists ONLY on that branch. The default is the dev-susfs tip as of 2026-10-03 (d2def5bc), frozen so a rerun cannot silently drift (that branch was rebased on 2026-10-03). RUN #21-#23 LESSON: upstream commits carry NO SUSFS - kernel/Kconfig at 39ba3821 (the commit the phone ksud 3.3.0-41 was built from) has ZERO KSU_SUSFS, so the kernel CANNOT be pinned to the userspace commit and the wiring gate will fail. Pin this and susfs_commit together, both at branch tips.'
+        description: 'KernelSU-Next branch, tag or commit. DEFAULT dev-susfs = always the LATEST commit on that branch; the resolved SHA is printed by the install step and recorded in the run summary, so every build stays identifiable. It MUST be a dev-susfs ref: SUSFS exists ONLY on that branch, and upstream commits carry ZERO KSU_SUSFS - 39ba3821, the commit the phone ksud 3.3.0-41 was built from, is upstream, and pinning to it failed runs #21 and #23. Pass a 40-char SHA only when you need to reproduce an older build exactly (a branch that gets rebased, as dev-susfs was on 2026-10-03, makes two runs incomparable).'
         required: true
-        default: 'd2def5bc34e0265acd677ff7c8d490d417689c14'
+        default: 'dev-susfs'
       susfs_branch:
         description: 'susfs4ksu branch on GitLab. Must carry a *android16-6.12* kernel patch.'
         required: true
         default: 'gki-android16-6.12'
       susfs_commit:
-        description: 'Pin susfs4ksu (GitLab) to this commit. Default = the gki-android16-6.12 branch tip as of 2026-10-03 (b213c541, dated 2026-09-26), which is the SUSFS that pairs with the KernelSU dev-susfs tip above. Do NOT use 75a613850178234c6c7595d1db8211716a011a2e: it is dated 2026-05-17 and predates the susfs_is_current_proc_no_su API the KSU tip calls, so the build dies with "call to undeclared function". Set EMPTY for the branch tip (same thing today, but it drifts).'
+        description: 'susfs4ksu (GitLab) commit. DEFAULT EMPTY = the gki-android16-6.12 branch tip, i.e. always the latest SUSFS, which is the partner for the KernelSU dev-susfs tip above; the resolved commit is recorded in the run summary. Do not pin 75a613850178234c6c7595d1db8211716a011a2e: dated 2026-05-17, it predates the susfs_is_current_proc_no_su API the KSU tip calls, so the build dies with "call to undeclared function". Put a SHA here only to reproduce an older build.'
         required: false
-        default: 'b213c54126fb243595ce7876e91d84d6e0861fec'
+        default: ''
       expected_uts_release:
         description: 'GATE: the exact UTS_RELEASE the built Image must report (i.e. uname -r). Default is the value the STOCK BOOT KERNEL carries, read by decompressing the factory boot.img: 6.12.69-android16-6-g5c5f2fea42dd-ab15835541-4k. (The vendor_dlkm modules carry a different Google build stamp - g6a49175400c0-ab16238327 - because Google builds them in a separate job; they stay loadable via symbol CRCs, so that is NOT what uname -r should say.) The workflow forces the release and the build timestamp into the build and fails if the Image disagrees. Empty = do not force, do not check.'
         required: false
@@ -483,6 +483,11 @@ jobs:
             echo "SUSFS pinned at $(git -C "$S" rev-parse --short HEAD) ($(git -C "$S" log -1 --format=%ci))"
           fi
           echo "SUSFS commit: $(git -C "$S" rev-parse --short HEAD)"
+          # Record the RESOLVED commit, not just the requested ref: with a branch input (="always
+          # the latest") the summary would otherwise show an empty pin and you could not tell which
+          # SUSFS a given build actually used. This is what makes a moving branch traceable.
+          echo "SUSFS_COMMIT=$(git -C "$S" rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "SUSFS_DATE=$(git -C "$S" log -1 --format=%cs)" >> "$GITHUB_ENV"
           SUSFS_VERSION=$(grep -m1 '#define SUSFS_VERSION' "$S/kernel_patches/include/linux/susfs.h" | awk -F'"' '{print $2}')
           echo "SUSFS_VERSION=${SUSFS_VERSION:-unknown}" >> "$GITHUB_ENV"
 
@@ -1290,8 +1295,8 @@ jobs:
             echo "| ACK branch | \`${{ inputs.kernel_branch }}\` |"
             echo "| KMI | android16-6.12 (sublevel ${{ inputs.expected_sublevel }}) |"
             echo "| Device patch level | ${{ inputs.os_patch_level }} |"
-            echo "| KernelSU-Next | \`${{ inputs.ksu_branch }}\` @ ${{ env.KSU_COMMIT }} (v${{ env.KSU_VERSION }}, ${{ env.KSU_GIT_TAG }}) |"
-            echo "| SUSFS | \`${{ inputs.susfs_branch }}\` @ ${{ inputs.susfs_commit }} (${{ env.SUSFS_VERSION }}) |"
+            echo "| KernelSU-Next | \`${{ inputs.ksu_branch }}\` @ ${KSU_COMMIT:-${{ env.KSU_COMMIT }}} (v${{ env.KSU_VERSION }}, ${{ env.KSU_GIT_TAG }}) |"
+            echo "| SUSFS | \`${{ inputs.susfs_branch }}\` @ ${SUSFS_COMMIT:-n/a} ${SUSFS_DATE:-} (${{ env.SUSFS_VERSION }}) |"
             echo "| Artifact | \`${{ env.FILE_NAME }}-AnyKernel3.zip\` (+ \`-Image\`, \`-Image.lz4\`) |"
             if [ -f "$GITHUB_WORKSPACE/artifacts/${{ env.FILE_NAME }}-boot.img" ]; then
               echo "| boot.img | \`${{ env.FILE_NAME }}-boot.img\` (mode \`${{ inputs.boot_img }}\`, header checked against the Google-authored init_boot reference) |"
