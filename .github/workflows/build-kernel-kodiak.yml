@@ -772,6 +772,45 @@ jobs:
             echo "expected_build_timestamp empty - timestamp left to kleaf"
           fi
 
+          # RUN #18 LESSON: patching stamp.bzl alone was NOT enough - the banner still read
+          # "#1 SMP PREEMPT Thu Jan  1 00:00:00 UTC 1970", because the SOURCE_DATE_EPOCH that actually
+          # reaches the compiler is resolved further down the stack (kleaf's _setup_env.sh, then the
+          # kernel's own scripts/mkcompile_h). mkcompile_h is the script that literally writes
+          # include/generated/compile.h, whose UTS_VERSION carries the banner timestamp, so setting the
+          # variables at the TOP of that script wins regardless of what the environment says - the same
+          # trick that already fixed the release string in setlocalversion. _setup_env.sh and the
+          # KLEAF_SOURCE_DATE_EPOCHS branch get the same treatment as belts, each asserted.
+          if [ -n "$STOCK_TS" ]; then
+            MK=common/scripts/mkcompile_h
+            if [ -f "$MK" ]; then
+              echo "--- $MK timestamp/date logic (before) ---"
+              grep -nE 'TIMESTAMP|SOURCE_DATE_EPOCH|date ' "$MK" || true
+              if ! grep -q 'CI: forced build timestamp' "$MK"; then
+                sed -i "2i KBUILD_BUILD_TIMESTAMP=\"$STOCK_TS\"; SOURCE_DATE_EPOCH=$EPOCH; export KBUILD_BUILD_TIMESTAMP SOURCE_DATE_EPOCH   # CI: forced build timestamp" "$MK"
+              fi
+              grep -q 'CI: forced build timestamp' "$MK" || { echo "::error::could not force the timestamp in $MK"; exit 1; }
+              echo "OK   $MK forces the timestamp at its top"
+            else
+              echo "::warning::$MK not found"
+            fi
+            for ENVF in build/kernel/_setup_env.sh build/_setup_env.sh; do
+              if [ -f "$ENVF" ]; then
+                echo "--- $ENVF timestamp logic (before) ---"
+                grep -nE 'SOURCE_DATE_EPOCH|KBUILD_BUILD_TIMESTAMP' "$ENVF" || true
+                if ! grep -q 'CI: forced build timestamp' "$ENVF"; then
+                  sed -i "1i export KBUILD_BUILD_TIMESTAMP=\"$STOCK_TS\"; export SOURCE_DATE_EPOCH=$EPOCH   # CI: forced build timestamp" "$ENVF"
+                fi
+                grep -q 'CI: forced build timestamp' "$ENVF" && echo "OK   $ENVF also forces the timestamp"
+              fi
+            done
+            if grep -q 'KLEAF_SOURCE_DATE_EPOCHS=' build/kernel/kleaf/impl/stamp.bzl; then
+              sed -i "s|^\(\s*\)export KLEAF_SOURCE_DATE_EPOCHS=.*|&\n\1export SOURCE_DATE_EPOCH=$EPOCH|" build/kernel/kleaf/impl/stamp.bzl
+              grep -q "export SOURCE_DATE_EPOCH=$EPOCH" build/kernel/kleaf/impl/stamp.bzl \
+                && echo "OK   stamp.bzl exports SOURCE_DATE_EPOCH=$EPOCH too" \
+                || echo "::warning::could not append the SOURCE_DATE_EPOCH export in stamp.bzl"
+            fi
+          fi
+
           EXPECT="${{ inputs.expected_uts_release }}"
           if [ -n "$EXPECT" ]; then
             # RUN #16 LESSON: emitting only the suffix produced a kernel whose banner read
