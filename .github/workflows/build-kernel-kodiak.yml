@@ -61,17 +61,17 @@ on:
         required: true
         default: 'https://github.com/pershoot/KernelSU-Next.git'
       ksu_branch:
-        description: 'KernelSU-Next branch/tag/commit. DEFAULT = the exact upstream commit the phone userspace was built from. Evidence from the working Wild Kernel: /data/adb/ksud reports "ksud 3.3.0-41-g39ba3821 (uapi: 2)", so the kernel side must be 39ba382175a3f48fe4d4bacb3cd55fa76d3fc97c (carried by both pershoot/KernelSU-Next and WildKernels/KernelSU-Next). Building the dev-susfs TIP instead (KSU v3.4.0) puts a kernel whose version disagrees with ksud on the phone: su comes up dead. Pair this with susfs_commit - never mix eras.'
+        description: 'KernelSU-Next ref. It MUST be a dev-susfs commit: SUSFS exists ONLY on that branch. The default is the dev-susfs tip as of 2026-10-03 (d2def5bc), frozen so a rerun cannot silently drift (that branch was rebased on 2026-10-03). RUN #21-#23 LESSON: upstream commits carry NO SUSFS - kernel/Kconfig at 39ba3821 (the commit the phone ksud 3.3.0-41 was built from) has ZERO KSU_SUSFS, so the kernel CANNOT be pinned to the userspace commit and the wiring gate will fail. Pin this and susfs_commit together, both at branch tips.'
         required: true
-        default: '39ba382175a3f48fe4d4bacb3cd55fa76d3fc97c'
+        default: 'd2def5bc34e0265acd677ff7c8d490d417689c14'
       susfs_branch:
         description: 'susfs4ksu branch on GitLab. Must carry a *android16-6.12* kernel patch.'
         required: true
         default: 'gki-android16-6.12'
       susfs_commit:
-        description: 'Pin susfs4ksu to this commit. DEFAULT = the SUSFS commit that matches the pinned KernelSU-Next 39ba3821 above (the pair WildKernels ship together for this KMI line): 75a613850178234c6c7595d1db8211716a011a2e. Pin the PAIR, never one half: the SUSFS branch tip calls susfs_is_current_proc_no_su / susfs_set_current_proc_no_su, which KernelSU-Next 39ba3821 predates, so mixing a tip SUSFS with a pinned kernel (or vice versa) dies at build time with "call to undeclared function". Set this EMPTY only when ksu_branch is the dev-susfs tip.'
+        description: 'Pin susfs4ksu (GitLab) to this commit. Default = the gki-android16-6.12 branch tip as of 2026-10-03 (b213c541, dated 2026-09-26), which is the SUSFS that pairs with the KernelSU dev-susfs tip above. Do NOT use 75a613850178234c6c7595d1db8211716a011a2e: it is dated 2026-05-17 and predates the susfs_is_current_proc_no_su API the KSU tip calls, so the build dies with "call to undeclared function". Set EMPTY for the branch tip (same thing today, but it drifts).'
         required: false
-        default: '75a613850178234c6c7595d1db8211716a011a2e'
+        default: 'b213c54126fb243595ce7876e91d84d6e0861fec'
       expected_uts_release:
         description: 'GATE: the exact UTS_RELEASE the built Image must report (i.e. uname -r). Default is the value the STOCK BOOT KERNEL carries, read by decompressing the factory boot.img: 6.12.69-android16-6-g5c5f2fea42dd-ab15835541-4k. (The vendor_dlkm modules carry a different Google build stamp - g6a49175400c0-ab16238327 - because Google builds them in a separate job; they stay loadable via symbol CRCs, so that is NOT what uname -r should say.) The workflow forces the release and the build timestamp into the build and fails if the Image disagrees. Empty = do not force, do not check.'
         required: false
