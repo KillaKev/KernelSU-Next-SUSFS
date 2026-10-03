@@ -595,12 +595,31 @@ jobs:
             line="${line#"${line%%[![:space:]]*}"}"
             line="${line%"${line##*[![:space:]]}"}"
             [ -z "$line" ] && return 0
-            case "$line" in
-              \#*) return 0 ;;
-              CONFIG_*) ;;
-              *) echo "  skip (not an assignment): $line"; return 0 ;;
-            esac
-            if [[ "$line" == *"="* ]]; then key="${line%%=*}"; value="${line#*=}"; else key="$line"; value="y"; fi
+            # "# CONFIG_X is not set" is a REAL instruction - it is how kconfig spells "force this
+            # off", and it is the only safe way to drop an option the stock defconfig enables.
+            # Handle it before the generic comment skip, so commented prose is still skipped.
+            if [[ "$line" =~ ^#\ (CONFIG_[A-Za-z0-9_]+)\ is\ not\ set$ ]]; then
+              key="${BASH_REMATCH[1]}"; value="n"
+            else
+              case "$line" in
+                \#*) return 0 ;;
+                CONFIG_*) ;;
+                *) echo "  skip (not an assignment): $line"; return 0 ;;
+              esac
+              if [[ "$line" == *"="* ]]; then key="${line%%=*}"; value="${line#*=}"; else key="$line"; value="y"; fi
+            fi
+            # value "n" has to be written the way a defconfig spells it.
+            if [ "$value" = "n" ]; then
+              if grep -q "^$key=" "$DEFCONFIG"; then
+                sed -i "s|^$key=.*|# $key is not set|g" "$DEFCONFIG"
+              elif grep -q "^# $key is not set" "$DEFCONFIG"; then
+                :
+              else
+                echo "# $key is not set" >> "$DEFCONFIG"
+              fi
+              echo "  # $key is not set"
+              return 0
+            fi
             if grep -q "^$key=" "$DEFCONFIG"; then
               sed -i "s|^$key=.*|$key=$value|g" "$DEFCONFIG"
             elif grep -q "^# $key is not set" "$DEFCONFIG"; then
@@ -623,6 +642,25 @@ jobs:
           else
             echo "--- VANILLA CONTROL: not touching any KSU option ---"
           fi
+
+          # ---------------------------------------------------------------------------
+          # MODULE-LOADING COMPATIBILITY - applied to EVERY build, control included, because
+          # this is what decides whether the phone's prebuilt vendor modules are accepted.
+          # Proven cause of the 2026-10-03 flash where 57 modules never loaded (Wi-Fi gone):
+          # the working Wild Kernel sets these and we did not. See the file for the evidence.
+          # ---------------------------------------------------------------------------
+          echo "--- applying .github/scripts/kodiak/module-compat.config (all builds) ---"
+          while IFS= read -r line || [ -n "$line" ]; do
+            apply_line "$line" || { echo "::error::could not apply module-compat line: [$line]"; exit 1; }
+          done < "$GITHUB_WORKSPACE/.github/scripts/kodiak/module-compat.config"
+          grep -nE '^CONFIG_MODULE_(ALLOW_BTF_MISMATCH|SCMVERSION)|^# CONFIG_MODULE_SIG_PROTECT is not set' "$DEFCONFIG" || true
+          # Report rather than fail: if this ACK tree has no such symbol the line is inert, and
+          # that must be visible instead of silent.
+          for k in CONFIG_MODULE_ALLOW_BTF_MISMATCH CONFIG_MODULE_SCMVERSION; do
+            grep -q "^$k=" "$DEFCONFIG" || echo "::warning::$k did not land - this ACK tree may not have that symbol"
+          done
+          grep -q '^# CONFIG_MODULE_SIG_PROTECT is not set' "$DEFCONFIG" \
+            || echo "::warning::CONFIG_MODULE_SIG_PROTECT was not forced off - check the defconfig"
 
           echo "--- KSU/SUSFS lines now in gki_defconfig ---"
           grep -nE '^CONFIG_KSU|^# CONFIG_KSU' "$DEFCONFIG" || echo "(none)"
