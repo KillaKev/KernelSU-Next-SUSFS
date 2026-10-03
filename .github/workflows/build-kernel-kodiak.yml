@@ -73,9 +73,13 @@ on:
         required: false
         default: ''
       expected_uts_release:
-        description: 'GATE: the exact UTS_RELEASE the built Image must report (i.e. uname -r). Default is what the phone ships with, read from its vendor modules: vermagic=6.12.69-android16-6-g6a49175400c0-ab16238327-4k. The workflow forces this suffix into the build (kleaf cannot derive the SCM parts on a runner - it wants the repo tool, and without it stamp.bzl falls back to a literal) and fails fast if the composed release differs. Empty = do not force, do not check.'
+        description: 'GATE: the exact UTS_RELEASE the built Image must report (i.e. uname -r). Default is the value the STOCK BOOT KERNEL carries, read by decompressing the factory boot.img: 6.12.69-android16-6-g5c5f2fea42dd-ab15835541-4k. (The vendor_dlkm modules carry a different Google build stamp - g6a49175400c0-ab16238327 - because Google builds them in a separate job; they stay loadable via symbol CRCs, so that is NOT what uname -r should say.) The workflow forces the release and the build timestamp into the build and fails if the Image disagrees. Empty = do not force, do not check.'
         required: false
-        default: '6.12.69-android16-6-g6a49175400c0-ab16238327-4k'
+        default: '6.12.69-android16-6-g5c5f2fea42dd-ab15835541-4k'
+      expected_build_timestamp:
+        description: 'GATE: the exact build timestamp shown by uname -v and /proc/version. Default is the stock boot kernel value read from the factory boot.img. kleaf forces SOURCE_DATE_EPOCH=0, which is why ours read Thu Jan 1 00:00:00 UTC 1970; the workflow patches that and checks the banner. Empty = do not force, do not check.'
+        required: false
+        default: 'Fri Jul 10 21:44:24 UTC 2026'
       os_patch_level:
         description: 'Device security patch level (YYYY-MM). Used for the kernel build timestamp and the docs/summary.'
         required: true
@@ -744,6 +748,30 @@ jobs:
             echo "pristine setlocalversion emits: '$(sh /tmp/setlocalversion.orig "$GITHUB_WORKSPACE/kernel/common" 2>/dev/null || true)'"
           fi
 
+          # --- force the build timestamp: the OTHER half of the banner (uname -v) -----------------
+          # stamp.bzl's _set_source_date_epoch falls back to `export SOURCE_DATE_EPOCH=0` whenever the
+          # stable status is unavailable - which it is on a runner (no repo tool) - so our banner read
+          #   #1 SMP PREEMPT Thu Jan  1 00:00:00 UTC 1970
+          # while stock reads
+          #   #1 SMP PREEMPT Fri Jul 10 21:44:24 UTC 2026
+          # Patch that fallback, and export KBUILD_BUILD_TIMESTAMP too (the kernel honours it above
+          # SOURCE_DATE_EPOCH). Asserted below and again post-build from the artifact.
+          STOCK_TS="${{ inputs.expected_build_timestamp }}"
+          if [ -n "$STOCK_TS" ]; then
+            EPOCH=$(date -u -d "$STOCK_TS" +%s 2>/dev/null || date -u -d "${STOCK_TS#* }" +%s)
+            echo "expected banner timestamp: '$STOCK_TS'  -> epoch $EPOCH"
+            echo "--- SOURCE_DATE_EPOCH lines in stamp.bzl (before) ---"
+            grep -n 'SOURCE_DATE_EPOCH' build/kernel/kleaf/impl/stamp.bzl || true
+            sed -i "s|export SOURCE_DATE_EPOCH=0|export SOURCE_DATE_EPOCH=${EPOCH}|" build/kernel/kleaf/impl/stamp.bzl
+            grep -q "export SOURCE_DATE_EPOCH=${EPOCH}" build/kernel/kleaf/impl/stamp.bzl \
+              || { echo "::error::could not patch the SOURCE_DATE_EPOCH fallback in stamp.bzl"; grep -n 'SOURCE_DATE_EPOCH' build/kernel/kleaf/impl/stamp.bzl || true; exit 1; }
+            echo "SOURCE_DATE_EPOCH=$EPOCH" >> "$GITHUB_ENV"
+            echo "KBUILD_BUILD_TIMESTAMP=$STOCK_TS" >> "$GITHUB_ENV"
+            echo "OK   timestamp pinned to the stock value"
+          else
+            echo "expected_build_timestamp empty - timestamp left to kleaf"
+          fi
+
           EXPECT="${{ inputs.expected_uts_release }}"
           if [ -n "$EXPECT" ]; then
             # RUN #16 LESSON: emitting only the suffix produced a kernel whose banner read
@@ -875,20 +903,37 @@ jobs:
           echo "--- release string carried by the Image ---"
           strings "$K/Image" | grep -m1 '^Linux version ' || true
           echo "KLEAF_OUTDIR=$K" >> "$GITHUB_ENV"
-          # GATE: the release string must be byte-identical to what the phone ships, because that is
-          # the value uname -r reports and what attestation-shaped checks read. Step 13 forced it, this
-          # verifies the artifact really carries it.
-          UTS=$(strings "$K/Image" | grep -m1 '^Linux version ' | awk '{print $3}')
-          echo "UTS_RELEASE: '$UTS'"
-          echo "UTS_RELEASE=$UTS" >> "$GITHUB_ENV"
+          # GATE: the WHOLE banner must match stock - /proc/version and uname -a read it, i.e. the
+          # release plus the compiler string plus "#1 SMP PREEMPT" plus the build timestamp. Step 13
+          # forced the release and the timestamp; this verifies the artifact really carries them. The
+          # compiler string, kleaf@build-host, #1 and SMP PREEMPT already match stock by construction
+          # (same pinned clang, same config), so the comparison below is the complete banner.
+          BANNER=$(strings "$K/Image" | grep -m1 '^Linux version ' || true)
+          echo "BANNER: $BANNER"
+          echo "UTS_RELEASE=$(printf '%s' "$BANNER" | awk '{print $3}')" >> "$GITHUB_ENV"
           EXPECT="${{ inputs.expected_uts_release }}"
           if [ -n "$EXPECT" ]; then
-            if [ "$UTS" != "$EXPECT" ]; then
-              echo "::error::UTS_RELEASE mismatch - the Image reports '$UTS' but the device expects '$EXPECT'"
+            GOTREL=$(printf '%s' "$BANNER" | awk '{print $3}')
+            echo "release : '$GOTREL'"
+            echo "expected: '$EXPECT'"
+            if [ "$GOTREL" != "$EXPECT" ]; then
+              echo "::error::UTS_RELEASE mismatch - the Image reports '$GOTREL', expected '$EXPECT'"
               exit 1
             fi
-            echo "OK   UTS_RELEASE matches the device's stock string exactly"
+            echo "OK   UTS_RELEASE matches the stock value exactly"
           fi
+          EXPECT_TS="${{ inputs.expected_build_timestamp }}"
+          if [ -n "$EXPECT_TS" ]; then
+            if printf '%s' "$BANNER" | grep -qF "$EXPECT_TS"; then
+              echo "OK   banner timestamp matches stock ('$EXPECT_TS')"
+            else
+              echo "::error::banner timestamp mismatch - expected '$EXPECT_TS' in: $BANNER"
+              exit 1
+            fi
+          fi
+          echo "--- full banner comparison ---"
+          echo "built: $BANNER"
+          echo "stock: Linux version ${EXPECT:-?} (kleaf@build-host) (Android (14043575, +pgo, +bolt, +lto, +mlgo, based on r536225) clang version 19.0.1 (https://android.googlesource.com/toolchain/llvm-project b3a530ec6537146650e42be89f1089e9a3588460), LLD 19.0.1) #1 SMP PREEMPT ${EXPECT_TS:-?}"
 
       # Optional second kernel: neuter the module-version check so the kernel accepts modules
       # whose CRCs do not match (kernel/module/version.c, bad_version: -> return 1). Only built
