@@ -61,17 +61,17 @@ on:
         required: true
         default: 'https://github.com/pershoot/KernelSU-Next.git'
       ksu_branch:
-        description: 'KernelSU-Next branch/tag. dev-susfs = the SUSFS-carrying branch.'
+        description: 'KernelSU-Next branch/tag/commit. DEFAULT = the exact upstream commit the phone userspace was built from. Evidence from the working Wild Kernel: /data/adb/ksud reports "ksud 3.3.0-41-g39ba3821 (uapi: 2)", so the kernel side must be 39ba382175a3f48fe4d4bacb3cd55fa76d3fc97c (carried by both pershoot/KernelSU-Next and WildKernels/KernelSU-Next). Building the dev-susfs TIP instead (KSU v3.4.0) puts a kernel whose version disagrees with ksud on the phone: su comes up dead. Pair this with susfs_commit - never mix eras.'
         required: true
-        default: 'dev-susfs'
+        default: '39ba382175a3f48fe4d4bacb3cd55fa76d3fc97c'
       susfs_branch:
         description: 'susfs4ksu branch on GitLab. Must carry a *android16-6.12* kernel patch.'
         required: true
         default: 'gki-android16-6.12'
       susfs_commit:
-        description: 'Pin susfs4ksu to this commit. Leave EMPTY to use the branch tip, which is what matches the KernelSU dev-susfs tip. (The old default 75a613850178234c6c7595d1db8211716a011a2e, taken from WildKernels commits.json, predates the susfs_is_current_proc_no_su / susfs_set_current_proc_no_su API that dev-susfs calls, so the build dies with "call to undeclared function".)'
+        description: 'Pin susfs4ksu to this commit. DEFAULT = the SUSFS commit that matches the pinned KernelSU-Next 39ba3821 above (the pair WildKernels ship together for this KMI line): 75a613850178234c6c7595d1db8211716a011a2e. Pin the PAIR, never one half: the SUSFS branch tip calls susfs_is_current_proc_no_su / susfs_set_current_proc_no_su, which KernelSU-Next 39ba3821 predates, so mixing a tip SUSFS with a pinned kernel (or vice versa) dies at build time with "call to undeclared function". Set this EMPTY only when ksu_branch is the dev-susfs tip.'
         required: false
-        default: ''
+        default: '75a613850178234c6c7595d1db8211716a011a2e'
       expected_uts_release:
         description: 'GATE: the exact UTS_RELEASE the built Image must report (i.e. uname -r). Default is the value the STOCK BOOT KERNEL carries, read by decompressing the factory boot.img: 6.12.69-android16-6-g5c5f2fea42dd-ab15835541-4k. (The vendor_dlkm modules carry a different Google build stamp - g6a49175400c0-ab16238327 - because Google builds them in a separate job; they stay loadable via symbol CRCs, so that is NOT what uname -r should say.) The workflow forces the release and the build timestamp into the build and fails if the Image disagrees. Empty = do not force, do not check.'
         required: false
@@ -1160,6 +1160,40 @@ jobs:
           ( cd "$A" && zip -r -9 "$GITHUB_WORKSPACE/artifacts/${FILE_NAME}-AnyKernel3.zip" . -x '.git/*' -x '.git' >/dev/null )
           cp "$K/Image"     "$GITHUB_WORKSPACE/artifacts/${FILE_NAME}-Image"
           cp "$K/Image.lz4" "$GITHUB_WORKSPACE/artifacts/${FILE_NAME}-Image.lz4"
+
+          # ---------------------------------------------------------------------------------------
+          # BENCH GATE PAYLOAD - why these two files are in the artifact set.
+          # The phone runs CONFIG_MODVERSIONS=y, so every prebuilt module records the CRC it expects
+          # for EVERY kernel symbol it imports and the kernel must match it exactly or the module is
+          # refused ("disagrees about version of symbol ... Unknown symbol (err -22)"). On the
+          # 2026-10-03 flash a dev-susfs-tip kernel left cfg80211/bcmdhd4383/bcmdhd4390 unloadable:
+          # 369 modules on the Wild Kernel, 312 on ours - dead Wi-Fi and a degraded modem stack.
+          # Module.symvers is the kernel's side of that contract, so crc_gate.py can diff it against
+          # the .ko files pulled off the phone BEFORE anything is flashed. The .config is included so
+          # a CRC surprise can be traced to a config difference instead of guessed at.
+          # kleaf/ACK emit the CRC table under either name - Module.symvers when the build
+          # produced modules, vmlinux.symvers when it only linked vmlinux (our Image-only build).
+          # Same format ('0x<crc>\t<symbol>\t<provider>'), so crc_gate.py reads either.
+          SYMV="$(find "$GITHUB_WORKSPACE/kernel" -name 'Module.symvers' -path '*kernel_aarch64*' -print -quit 2>/dev/null || true)"
+          if [ -z "$SYMV" ]; then
+            SYMV="$(find "$GITHUB_WORKSPACE/kernel" -name 'vmlinux.symvers' -print -quit 2>/dev/null || true)"
+          fi
+          if [ -z "$SYMV" ]; then
+            SYMV="$(find "$GITHUB_WORKSPACE/kernel" -name '*symvers' -print -quit 2>/dev/null || true)"
+          fi
+          if [ -n "$SYMV" ]; then
+            echo "CRC table: $SYMV"
+            cp "$SYMV" "$GITHUB_WORKSPACE/artifacts/${FILE_NAME}-Module.symvers"
+            echo "exported symbol CRCs in it: $(wc -l < "$SYMV")"
+          else
+            echo "::warning::no *symvers file found anywhere under kernel/ - the bench CRC gate cannot run on this build"
+            find "$GITHUB_WORKSPACE/kernel" -maxdepth 4 -name 'vmlinux*' 2>/dev/null | head -5 || true
+          fi
+          if [ -f "$K/.config" ]; then
+            cp "$K/.config" "$GITHUB_WORKSPACE/artifacts/${FILE_NAME}-kernel.config"
+          else
+            echo "(no $K/.config to upload - skipping)"
+          fi
           ls -la "$GITHUB_WORKSPACE/artifacts"
 
       - name: Upload artifacts
@@ -1195,6 +1229,7 @@ jobs:
             fi
             echo
             echo "### Flashing (keep the phone rooted and backed up)"
+            echo "0. **BENCH GATE FIRST - this is the step that failed on 2026-10-03.** \`python crc_gate.py --symvers ${FILE_NAME}-Module.symvers --modules <pulled device module dir>\`: every module imported by the phone must find its EXACT symbol CRC in our Module.symvers. If it cannot, that module will be refused at load and take its subsystem down (Wi-Fi = cfg80211 + bcmdhd4383/4390). Do not flash on a red gate."
             echo "1. \`adb shell su -c \"dd if=/dev/block/by-name/boot_a of=/sdcard/boot_a-pre-ci.img\"\` - always have the current boot image."
             echo "2. Install **${{ env.FILE_NAME }}-AnyKernel3.zip** with KernelFlasher (or any AK3 flasher). It repacks the LIVE boot partition, keeps the header/AVB fields and refuses non-6.12 kernels."
             echo "3. Reboot, then run the verification checklist in the repo README."
