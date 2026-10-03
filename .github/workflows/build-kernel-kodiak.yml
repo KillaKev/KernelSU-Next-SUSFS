@@ -361,8 +361,39 @@ jobs:
           }
 
           test -d KernelSU-Next/kernel || { echo "::error::setup.sh did not produce KernelSU-Next/kernel"; exit 1; }
-          git -C KernelSU-Next/kernel fetch --depth=50 origin "$KSU_REF" || true
-          git -C KernelSU-Next/kernel checkout "origin/$KSU_REF" 2>/dev/null || git -C KernelSU-Next/kernel checkout "$KSU_REF"
+
+          # ---------------------------------------------------------------------------------
+          # PIN THE REF EXACTLY - RUN #21 LESSON. This is where that run died, silently, and the
+          # Kconfig gate 10 minutes later was the only thing that noticed:
+          #   setup.sh CLONES A REPO and checks its argument out as a BRANCH (falling back to the
+          #   clone's default branch). Our pinned ref is a commit SHA, so the checkout could not
+          #   land on it and the tree stayed on the clone's DEFAULT branch - upstream
+          #   KernelSU-Next, which carries no SUSFS at all. The gate then said "this
+          #   KernelSU-Next ref does NOT carry SUSFS", which was true but blamed the ref rather
+          #   than the missing checkout.
+          # So: point origin at the requested fork, fetch the ref explicitly, detach - and ASSERT.
+          # Never trust setup.sh's checkout when the ref is a SHA.
+          # ---------------------------------------------------------------------------------
+          git -C KernelSU-Next/kernel remote set-url origin "$KSU_REPO"
+          if ! git -C KernelSU-Next/kernel fetch --depth=200 origin "$KSU_REF"; then
+            echo "direct fetch of $KSU_REF failed - deepening from the branch instead"
+            git -C KernelSU-Next/kernel fetch --depth=2000 origin dev-susfs \
+              || git -C KernelSU-Next/kernel fetch origin dev-susfs
+            git -C KernelSU-Next/kernel fetch origin "$KSU_REF" \
+              || { echo "::error::cannot obtain $KSU_REF from $KSU_REPO"; exit 1; }
+          fi
+          git -C KernelSU-Next/kernel checkout --detach FETCH_HEAD
+          HEAD_SHA=$(git -C KernelSU-Next/kernel rev-parse HEAD)
+          echo "KernelSU-Next HEAD now: $HEAD_SHA   (requested: $KSU_REF)"
+          case "$KSU_REF" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*)
+              [ "$HEAD_SHA" = "$KSU_REF" ] || {
+                echo "::error::KernelSU-Next HEAD is $HEAD_SHA but the requested commit is $KSU_REF - refusing to build from the wrong tree"
+                exit 1; } ;;
+            *) echo "  (ref is a branch/tag - HEAD is wherever it points now)" ;;
+          esac
+          KSU_SUSFS_N=$(grep -c 'KSU_SUSFS' KernelSU-Next/kernel/Kconfig 2>/dev/null || true)
+          echo "KSU_SUSFS occurrences in the installed kernel/Kconfig: ${KSU_SUSFS_N:-0} (the gate below needs >0)"
 
           # Version stamping, exactly as KernelSU-Next does it upstream: the manager compares
           # these fallbacks with its own API. Without this the manager reports a bogus version.
