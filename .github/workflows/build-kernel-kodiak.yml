@@ -128,6 +128,7 @@ on:
           - none
           - heybooboo-phase12
           - phase3
+          - phase4
       nomount_commit:
         description: 'NoMount is ALWAYS built in. By default the latest commit on master is used - leave this empty. Pass a full 40-char SHA only to assert an exact revision; the run then fails if HEAD does not match.'
         required: false
@@ -907,6 +908,50 @@ jobs:
       # pre-compiled nomount.ko into the module's lkm/ folder, but a custom kernel is exactly the
       # case where built-in is the reliable option. NoMount is therefore ALWAYS built in: there
       # is no toggle to forget, and nomount_commit only exists to pin a revision if ever needed.
+      # ------------------------------------------------------- 6e. phase 4: baseband-guard LSM
+      # Write-protects the phone's baseband/boot partitions outside a narrow allowlist. Three commits,
+      # and unlike phase 3 there is NO rebase to carry: verified offline against the exact phase-3 tree
+      # (mock_apply --shas ... --apply --reject), all apply cleanly and every post-condition holds,
+      # because nothing they touch moved between 6.12.69 and their 6.12.93.
+      #   ea4b5ea437  reserve the LSM slot in include/linux/lsm_count.h
+      #   7b9693fbdb  wire it up: security/Kconfig source + security/Makefile obj-$(CONFIG_BBG)
+      #   23baed360e  the LSM itself: 16 new files under security/baseband-guard/
+      # Their arch/arm64/configs/heybooboo_gki.fragment change is theirs alone and is excluded; its
+      # content is reproduced as baseband.config by the config step.
+      - name: "Features - phase 4: baseband-guard LSM"
+        if: ${{ inputs.features == 'phase4' }}
+        run: |
+          set -o pipefail
+          cd "$GITHUB_WORKSPACE/kernel/common"
+          FEAT_REPO="asdfmonster261/heybooboo-kernel"
+          TMP="$(mktemp -d)"
+          for SHA in ea4b5ea437 7b9693fbdb 23baed360e; do
+          P="$TMP/$SHA.patch"
+          curl -fsSL "https://github.com/$FEAT_REPO/commit/$SHA.patch" -o "$P" \
+          || { echo "::error::cannot download $FEAT_REPO commit $SHA"; exit 1; }
+          SUBJ="$(sed -n 's/^Subject: \[PATCH\] //p' "$P" | head -1)"
+          echo "--- $SHA  $SUBJ"
+          if ! git apply --check --exclude=arch/arm64/configs/heybooboo_gki.fragment "$P" 2>"$TMP/err"; then
+          echo "::error::$SHA does not apply cleanly to this tree:"
+          sed -n '1,6p' "$TMP/err"
+          exit 1
+          fi
+          git apply --exclude=arch/arm64/configs/heybooboo_gki.fragment "$P"
+          done
+          # Post-conditions: a patch that "applied" without adding its files is the failure mode that would
+          # otherwise surface only as a kernel that boots without the LSM.
+          for f in security/baseband-guard/baseband_guard.c security/baseband-guard/Kconfig \
+          security/baseband-guard/Makefile security/baseband-guard/tracing/tracing.c; do
+          test -f "$f" || { echo "::error::$f is missing after the phase-4 patches"; exit 1; }
+          done
+          n="$(grep -c 'baseband_guard' include/linux/lsm_count.h || true)"
+          [ "$n" -ge 1 ] || { echo "::error::baseband_guard did not reserve its LSM slot"; exit 1; }
+          n="$(grep -c 'source "security/baseband-guard/Kconfig"' security/Kconfig || true)"
+          [ "$n" = "1" ] || { echo "::error::security/Kconfig wiring is wrong (found $n)"; exit 1; }
+          n="$(grep -c 'obj-$(CONFIG_BBG) += baseband-guard/' security/Makefile || true)"
+          [ "$n" = "1" ] || { echo "::error::security/Makefile wiring is wrong (found $n)"; exit 1; }
+          echo "ok: baseband-guard LSM integrated (16 files, slot reserved, security/{Kconfig,Makefile} wired)"
+
       - name: "NoMount - integrate the VFS path redirection framework"
         run: |
           set -o pipefail
@@ -1075,6 +1120,32 @@ jobs:
               apply_line "$line" || { echo "::error::could not apply bore line: [$line]"; exit 1; }
             done < "$GITHUB_WORKSPACE/.github/scripts/kodiak/bore.config"
             grep -n '^CONFIG_SCHED_BORE=' "$DEFCONFIG" || echo "::warning::CONFIG_SCHED_BORE did not take in the defconfig"
+          fi
+
+          # ---------------------------------------------------------------------------
+          # PHASE 4 (baseband-guard LSM): CONFIG_BBG=y comes from the fragment, but the LSM only
+          # runs if its name is in CONFIG_LSM - and that is a STRING. apply_line is built for
+          # booleans/tristates ("# CONFIG_X is not set" is its other valid form), so the string
+          # half is done here with kconfig's own scripts/config. It APPENDS to whatever the tree
+          # already lists instead of replacing it: the stock string also carries `integrity`, and
+          # dropping it would be a silent behavioural change nothing else would notice.
+          # ---------------------------------------------------------------------------
+          if [ "${{ inputs.features }}" = "phase4" ]; then
+            echo "--- applying .github/scripts/kodiak/baseband.config (phase 4) ---"
+            while IFS= read -r line || [ -n "$line" ]; do
+              apply_line "$line" || { echo "::error::could not apply baseband line: [$line]"; exit 1; }
+            done < "$GITHUB_WORKSPACE/.github/scripts/kodiak/baseband.config"
+            grep -n '^CONFIG_BBG=' "$DEFCONFIG" || { echo "::error::CONFIG_BBG did not take in the defconfig - the LSM would not be built"; exit 1; }
+            LSM="$(scripts/config --file "$DEFCONFIG" --state CONFIG_LSM 2>/dev/null | sed -n 's/^CONFIG_LSM="\(.*\)"$/\1/p')"
+            [ -n "$LSM" ] || LSM="lockdown,yama,loadpin,safesetid,integrity,selinux,smack,tomoyo,apparmor,bpf"
+            case ",$LSM," in
+              *,baseband_guard,*) echo "CONFIG_LSM already lists baseband_guard" ;;
+              *) scripts/config --file "$DEFCONFIG" --set-str CONFIG_LSM "$LSM,baseband_guard"
+                 echo "CONFIG_LSM was [$LSM], now [$(scripts/config --file "$DEFCONFIG" --state CONFIG_LSM)]" ;;
+            esac
+            grep -q 'baseband_guard' "$DEFCONFIG" \
+              || { echo "::error::baseband_guard is not in CONFIG_LSM - the LSM would never be invoked"; exit 1; }
+            grep -n '^CONFIG_BBG=\|^CONFIG_LSM=' "$DEFCONFIG" || true
           fi
 
           # ---------------------------------------------------------------------------
