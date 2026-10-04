@@ -1786,7 +1786,7 @@ jobs:
           grep -q 'pixel11 CI ksud install' "$A/anykernel.sh" \
             || { echo "::error::ksud install block did not land in anykernel.sh"; exit 1; }
           echo "anykernel.sh patched; first 4 lines:"; head -4 "$A/anykernel.sh" || true
-          ls -la "$A/ksud" "$A/anykernel.sh"
+          ls -la "$A/ksud" "$A/anykernel.sh" || true
 
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
           ( cd "$A" && zip -r -9 "$GITHUB_WORKSPACE/artifacts/${FILE_NAME}-AnyKernel3.zip" . -x '.git/*' -x '.git' >/dev/null )
@@ -1909,7 +1909,7 @@ jobs:
             echo "| Device | Pixel 11 Pro XL (**kodiak**, Tensor G6) |"
             echo "| Features | \`${{ inputs.features }}\` (heybooboo port: containers/SysV IPC, ntsync, BBRv3, qdiscs, netfilter/ipset, f2fs/vfs/int_sqrt, tcpm DRP; \`none\` = run #30) |"
             echo "| NoMount | always built in from maxsteeel/nomount @ ${NOMOUNT_COMMIT:-latest master} (CONFIG_NOMOUNT=y, VFS path redirection) |"
-            echo "| Userspace | KernelSU-Next \\`KERNEL_SU_UAPI_VERSION\\` = ${KSU_UAPI:-?} | latest Build Manager CI \\`${KSU_CI_SHA:-not resolved}\\` (uapi ${KSU_CI_UAPI:-?}, ${KSU_CI_DATE:-?}) - run ${KSU_CI_ID:-n/a} |"
+            echo "| Userspace | KernelSU-Next \`KERNEL_SU_UAPI_VERSION\` = ${KSU_UAPI:-?} | latest Build Manager CI \`${KSU_CI_SHA:-not resolved}\` (uapi ${KSU_CI_UAPI:-?}, ${KSU_CI_DATE:-?}) - run ${KSU_CI_ID:-n/a} |"
             echo "| ACK branch | \`${{ inputs.kernel_branch }}\` |"
             echo "| KMI | android16-6.12 (sublevel ${{ inputs.expected_sublevel }}) |"
             echo "| Device patch level | ${{ inputs.os_patch_level }} |"
@@ -1927,7 +1927,7 @@ jobs:
             echo "1. \`adb shell su -c \"dd if=/dev/block/by-name/boot_a of=/sdcard/boot_a-pre-ci.img\"\` - always have the current boot image."
             echo "2. Install **${{ env.FILE_NAME }}-AnyKernel3.zip** with KernelFlasher (or any AK3 flasher). It repacks the LIVE boot partition, keeps the header/AVB fields and refuses non-6.12 kernels."
             if [ -n "${KSU_CI_URL:-}" ]; then
-              echo "2b. **Install the MATCHING KernelSU manager.** This run's artifacts include \\`${{ env.FILE_NAME }}-manager-spoofed.apk\\` (CI run ${KSU_CI_ID}, uapi ${KSU_CI_UAPI}) - \\`adb install -r\\` it, adding \\`-d\\` if the phone already has a newer version. Installing an OLDER manager is what broke root on 2026-10-04: a uapi $KSU_UAPI kernel will not talk to a older ksud, and \\`su\\` simply never appears. The AK3 zip installs the matching ksud to \\`/data/adb/ksud\\` at flash time when it was fetched."
+              echo "2b. **Install the MATCHING KernelSU manager.** This run's artifacts include \`${{ env.FILE_NAME }}-manager-spoofed.apk\` (CI run ${KSU_CI_ID}, uapi ${KSU_CI_UAPI}) - \`adb install -r\` it, adding \`-d\` if the phone already has a newer version. Installing an OLDER manager is what broke root on 2026-10-04: a uapi $KSU_UAPI kernel will not talk to a older ksud, and \`su\` simply never appears. The AK3 zip installs the matching ksud to \`/data/adb/ksud\` at flash time when it was fetched."
             fi
             echo "3. Reboot, then run the verification checklist in the repo README."
             if [ -f "$GITHUB_WORKSPACE/artifacts/${{ env.FILE_NAME }}-boot.img" ]; then
