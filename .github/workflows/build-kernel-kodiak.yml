@@ -698,6 +698,46 @@ jobs:
           grep -q '^# CONFIG_MODULE_SIG_PROTECT is not set' "$DEFCONFIG" \
             || echo "::warning::CONFIG_MODULE_SIG_PROTECT was not forced off - check the defconfig"
 
+          # ---------------------------------------------------------------------------
+          # MODULE_SIG_PROTECT - the actual cause of the missing modules, fixed by CONTENT.
+          # Android protects a list of modules by requiring their signature to verify. Our build
+          # trusts its own generated key while every module on the phone is Google-signed, so each
+          # module on that list is refused at load. MEASURED after flashing run #25: exactly 58
+          # modules never loaded, and they are the whole connectivity stack - cfg80211, mac80211,
+          # bcmdhd4390, wonder, bluetooth, btbcm, btqca, btsdio, hci_uart, hidp, nfc, wwan, ppp*,
+          # l2tp*, tipc*, 6lowpan, ieee802154*, nhc_*, usbnet, cdc_*, r8152, asix, ax88179_178a,
+          # aqc111, mii, slhc, bsd_comp, pppox, pptp, pps_core, ptp, rfkill, bpf, virtio_pci*,
+          # libarc4, pwrseq_core, lwis, nitrous, mtk_common, mtk_pcie.
+          # Setting CONFIG_MODULE_SIG_PROTECT_LIST="" in the defconfig does NOT work: kconfig
+          # ignores an empty string assignment (verified in run #25's built config - it still read
+          # "protected_module_names_list"). The LIST FILE is what defines the protected set, so
+          # empty that instead, and print what was in it as evidence.
+          # ---------------------------------------------------------------------------
+          LISTNAME=$(grep -m1 '^CONFIG_MODULE_SIG_PROTECT_LIST=' "$DEFCONFIG" | sed 's/^[^=]*=//' | tr -d '"')
+          echo "MODULE_SIG_PROTECT names this list file: [$LISTNAME]"
+          if [ -n "$LISTNAME" ]; then
+            FOUND=""
+            for cand in "$GITHUB_WORKSPACE/kernel/common/$LISTNAME" \
+                        "$GITHUB_WORKSPACE/kernel/common/android/$LISTNAME"; do
+              if [ -f "$cand" ]; then FOUND="$cand"; break; fi
+            done
+            if [ -z "$FOUND" ]; then
+              FOUND=$(find "$GITHUB_WORKSPACE/kernel" -maxdepth 4 -name "$(basename "$LISTNAME")" \
+                        -not -path '*/.git/*' -print -quit 2>/dev/null || true)
+            fi
+            if [ -n "$FOUND" ]; then
+              echo "protected module list found: $FOUND"
+              echo "  entries: $(wc -l < "$FOUND") lines, $(wc -c < "$FOUND") bytes"
+              echo "---- first 40 (these were being REFUSED at load by our signing key) ----"
+              head -40 "$FOUND" || true
+              echo "---- end of list ----"
+              : > "$FOUND"
+              echo "list emptied: now $(wc -c < "$FOUND") bytes -> nothing is signature-protected"
+            else
+              echo "::warning::protected list '$LISTNAME' not found under kernel/ - the build may generate it"
+            fi
+          fi
+
           echo "--- KSU/SUSFS lines now in gki_defconfig ---"
           grep -nE '^CONFIG_KSU|^# CONFIG_KSU' "$DEFCONFIG" || echo "(none)"
 
