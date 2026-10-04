@@ -738,6 +738,61 @@ jobs:
             fi
           fi
 
+          # ---------------------------------------------------------------------------
+          # PROTECTED EXPORTS - the REAL cause of the 58 refused modules. Measured on the device
+          # with run #27 (dmesg, read with root): the kernel refuses any module that EXPORTS a
+          # symbol on its protected-exports list. Exactly 14 were refused for that reason -
+          #   rfkill (rfkill_alloc)        libarc4 (arc4_crypt)      mii (generic_mii_ioctl)
+          #   slhc (slhc_compress)         tipc (tipc_dump_done)    pps_core (pps_event)
+          #   6lowpan (lowpan_nhc_add)     ieee802154 (wpan_phy_find) l2tp_core (l2tp_recv_common)
+          #   wwan (wwan_create_port)      netfs (__traceiter_netfs_sreq)
+          #   pwrseq_core (devm_pwrseq_device_register)
+          #   virtio_pci_legacy_dev / virtio_pci_modern_dev
+          # - and the other 44 (cfg80211, mac80211, bcmdhd4390, wonder, bluetooth, ppp*, ...) are
+          # their dependents. No other failure class appears in the kernel log (rust_binder aside).
+          #
+          # NOTE: setting CONFIG_MODULE_SIG_PROTECT_LIST="" did NOT take (kconfig ignores an empty
+          # string), and the earlier module-names approach targeted the wrong list: this one is a
+          # list of SYMBOLS. So: find the file that actually carries them (>=3 of the known
+          # symbols, so driver sources like net/rfkill/core.c cannot match), SHOW it, and EMPTY it.
+          # ---------------------------------------------------------------------------
+          echo "=== protected-exports files in the tree ==="
+          PSYMS="rfkill_alloc arc4_crypt generic_mii_ioctl slhc_compress tipc_dump_done pps_event lowpan_nhc_add wpan_phy_find l2tp_recv_common wwan_create_port"
+          PFILES="$(grep -rl --include='*' -F -e rfkill_alloc -e arc4_crypt -e slhc_compress \
+                     -e tipc_dump_done -e wpan_phy_find "$GITHUB_WORKSPACE/kernel/common" 2>/dev/null || true)"
+          FOUND_LIST=""
+          for pf in $PFILES; do
+            cnt=0
+            for s in $PSYMS; do
+              if grep -q -F "$s" "$pf" 2>/dev/null; then cnt=$((cnt+1)); fi
+            done
+            if [ "$cnt" -ge 3 ]; then
+              echo "  LIST CANDIDATE ($cnt/10 symbols): $pf  ($(wc -l < "$pf") lines, $(wc -c < "$pf") bytes)"
+              echo "    first 10 lines:"; head -10 "$pf" | sed 's/^/      /' || true
+              FOUND_LIST="$FOUND_LIST $pf"
+            fi
+          done
+          [ -n "$FOUND_LIST" ] || echo "  (no file carries >=3 of those symbols - the list must be generated)"
+          for pf in $FOUND_LIST; do
+            : > "$pf"
+            echo "  emptied: $pf -> $(wc -c < "$pf") bytes"
+          done
+
+          echo "=== files named like protected exports / abi lists ==="
+          find "$GITHUB_WORKSPACE/kernel" -maxdepth 6 -type f \
+            \( -name '*protected_exports*' -o -name '*protected_modules*' -o -name 'abi_gki_*' \) \
+            -not -path '*/.git/*' 2>/dev/null | head -25 | while read -r pf; do
+              echo "  $pf  ($(wc -c < "$pf") bytes)"
+            done || true
+
+          echo "=== the code that emits the refusal (patch material if emptying is not enough) ==="
+          CODEF="$(grep -rl -F 'exports protected symbol' "$GITHUB_WORKSPACE/kernel/common" 2>/dev/null | head -3 || true)"
+          echo "  file(s): ${CODEF:-none found}"
+          for cf in $CODEF; do
+            echo "  --- $cf ---"
+            grep -n -B 8 -A 4 -F 'exports protected symbol' "$cf" || true
+          done
+
           echo "--- KSU/SUSFS lines now in gki_defconfig ---"
           grep -nE '^CONFIG_KSU|^# CONFIG_KSU' "$DEFCONFIG" || echo "(none)"
 
