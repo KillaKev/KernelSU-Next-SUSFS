@@ -128,18 +128,10 @@ on:
           - none
           - heybooboo-phase12
           - phase3
-      nomount:
-        description: 'Build NoMount (maxsteeel/nomount) into the kernel - a VFS path-redirection framework. Built-in support is what the NoMount metamodule probes for first ("nm version"); without it, on a custom kernel, it falls back to a pre-compiled LKM it may not have, which is exactly what "Kernel not patched or module failed to load" means. Independent of features.'
-        required: false
-        default: 'off'
-        type: choice
-        options:
-          - 'off'
-          - 'on'
       nomount_commit:
-        description: 'NoMount commit to build. DEFAULT = the pinned latest on master (c5fad9d8f97c, 2026-10-01). Pass a full 40-char SHA to assert an exact revision; the run fails if HEAD does not match.'
+        description: 'NoMount is ALWAYS built in. By default the latest commit on master is used - leave this empty. Pass a full 40-char SHA only to assert an exact revision; the run then fails if HEAD does not match.'
         required: false
-        default: 'c5fad9d8f97c5a207f7342fd91789449915ea047'
+        default: ''
 
 jobs:
   build:
@@ -883,9 +875,9 @@ jobs:
       #
       # This is the LKM-vs-built-in distinction their README makes: GKI users can instead drop a
       # pre-compiled nomount.ko into the module's lkm/ folder, but a custom kernel is exactly the
-      # case where built-in is the reliable option.
+      # case where built-in is the reliable option. NoMount is therefore ALWAYS built in: there
+      # is no toggle to forget, and nomount_commit only exists to pin a revision if ever needed.
       - name: "NoMount - integrate the VFS path redirection framework"
-        if: ${{ inputs.nomount == 'on' }}
         run: |
           set -o pipefail
           cd "$GITHUB_WORKSPACE/kernel/common"
@@ -1056,16 +1048,15 @@ jobs:
           fi
 
           # ---------------------------------------------------------------------------
-          # NOMOUNT (independent of features): the symbol only exists because the NoMount
-          # step copied fs/nomount/Kconfig into the tree and wired it into fs/Kconfig.
+          # NOMOUNT: always built in, like module-compat - no toggle to forget. The symbol
+          # exists because the NoMount step copied fs/nomount/Kconfig into the tree and wired
+          # it into fs/Kconfig.
           # ---------------------------------------------------------------------------
-          if [ "${{ inputs.nomount }}" = "on" ]; then
-            echo "--- applying .github/scripts/kodiak/nomount.config ---"
-            while IFS= read -r line || [ -n "$line" ]; do
-              apply_line "$line" || { echo "::error::could not apply nomount line: [$line]"; exit 1; }
-            done < "$GITHUB_WORKSPACE/.github/scripts/kodiak/nomount.config"
-            grep -n '^CONFIG_NOMOUNT=' "$DEFCONFIG" || echo "::warning::CONFIG_NOMOUNT did not take in the defconfig"
-          fi
+          echo "--- applying .github/scripts/kodiak/nomount.config (every build) ---"
+          while IFS= read -r line || [ -n "$line" ]; do
+            apply_line "$line" || { echo "::error::could not apply nomount line: [$line]"; exit 1; }
+          done < "$GITHUB_WORKSPACE/.github/scripts/kodiak/nomount.config"
+          grep -n '^CONFIG_NOMOUNT=' "$DEFCONFIG" || echo "::warning::CONFIG_NOMOUNT did not take in the defconfig"
           grep -nE '^CONFIG_MODULE_(ALLOW_BTF_MISMATCH|SCMVERSION)|^# CONFIG_MODULE_SIG_PROTECT is not set' "$DEFCONFIG" || true
           # Report rather than fail: if this ACK tree has no such symbol the line is inert, and
           # that must be visible instead of silent.
@@ -1889,7 +1880,8 @@ jobs:
             echo "| | |"
             echo "|---|---|"
             echo "| Device | Pixel 11 Pro XL (**kodiak**, Tensor G6) |"
-            echo "| Features | \\`${{ inputs.features }}\\` (heybooboo port phase 1+2 = container namespaces/SysV IPC, binfmt fixes, ntsync, BBRv3, f2fs/vfs/int_sqrt, tcpm DRP \\`none\\` = run #30) |"
+            echo "| Features | \`${{ inputs.features }}\` (heybooboo port: containers/SysV IPC, ntsync, BBRv3, qdiscs, netfilter/ipset, f2fs/vfs/int_sqrt, tcpm DRP; \`none\` = run #30) |"
+            echo "| NoMount | always built in from maxsteeel/nomount @ ${NOMOUNT_COMMIT:-latest master} (CONFIG_NOMOUNT=y, VFS path redirection) |"
             echo "| ACK branch | \`${{ inputs.kernel_branch }}\` |"
             echo "| KMI | android16-6.12 (sublevel ${{ inputs.expected_sublevel }}) |"
             echo "| Device patch level | ${{ inputs.os_patch_level }} |"
