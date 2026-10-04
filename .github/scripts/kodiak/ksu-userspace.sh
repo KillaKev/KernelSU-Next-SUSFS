@@ -73,6 +73,8 @@ echo "ok: this kernel and the latest CI userspace agree on uapi $KUI - the pair 
 #     secret. Without it the run continues and the summary names the CI run to install from.
 #   * what must NEVER happen is a fallback to an OLDER userspace. That is the mismatch this whole
 #     step exists to prevent, so a failed download ships the Image alone and says so.
+#   * WITH a KSU_CI_TOKEN secret, delivery is a promise: a missing or undownloadable artifact fails
+#     the run instead of warning, because a silent "no APK" is indistinguishable from success.
 # --------------------------------------------------------------------------------------------
 UD="${GITHUB_WORKSPACE}/userspace"
 mkdir -p "$UD" "${GITHUB_WORKSPACE}/artifacts"
@@ -91,23 +93,29 @@ if [ -z "$TOK" ]; then
   exit 0
 fi
 
+# A TOKEN IS A PROMISE. With KSU_CI_TOKEN set, a missing or undownloadable artifact is a hard
+# failure, not a warning: the point of the secret is that the run DELIVERS the userspace, and
+# degrading quietly to "no APK" is exactly the silent behaviour that cost the 2026-10-04 flash its
+# root. Without the secret the code above has already exited, so this only fires when delivery was
+# asked for and did not happen.
 for want in manager-spoofed mappings-spoofed; do
   ID="$(awk -v n="$want" '$1 == n { print $2 }' "$UD/artifacts.txt" | head -1 || true)"
   if [ -z "$ID" ]; then
-    echo "::warning::artifact $want is not in CI run $CI_ID"
-    continue
+    echo "::error::artifact $want is not in CI run $CI_ID, but a KSU_CI_TOKEN is set - the pair was expected"
+    exit 1
   fi
   if curl -fsSL -H "Authorization: token $TOK" -H 'User-Agent: kodiak-ci' \
        "https://api.github.com/repos/$UP/actions/artifacts/$ID/zip" -o "$UD/$want.zip"; then
     echo "downloaded $want ($(stat -c%s "$UD/$want.zip") bytes)"
   else
-    echo "::warning::cannot download $want - a classic PAT needs the repo scope, a fine-grained one needs Actions:read on $UP"
+    echo "::error::cannot download $want with the KSU_CI_TOKEN provided - a classic PAT needs the repo scope, a fine-grained one needs Actions:read on $UP (has it expired or been revoked?)"
+    exit 1
   fi
 done
 
 if [ ! -f "$UD/manager-spoofed.zip" ]; then
-  echo "::warning::manager-spoofed was not downloaded - this run ships the Image only"
-  exit 0
+  echo "::error::manager-spoofed is not on disk - this run would ship the Image only"
+  exit 1
 fi
 mkdir -p "$UD/manager-spoofed"
 ( cd "$UD/manager-spoofed" && unzip -o "$UD/manager-spoofed.zip" >/dev/null )
@@ -118,11 +126,19 @@ if [ -z "$APK" ]; then
   APK="$UD/manager.apk"
 fi
 if [ -z "$APK" ] || [ ! -f "$APK" ]; then
-  echo "::warning::the manager-spoofed artifact holds no file - nothing to ship"
-  exit 0
+  echo "::error::the manager-spoofed artifact holds no file - there is nothing to ship"
+  exit 1
 fi
 cp -f "$APK" "${GITHUB_WORKSPACE}/artifacts/${FILE_NAME}-manager-spoofed.apk"
 echo "shipping ${FILE_NAME}-manager-spoofed.apk from CI run $CI_ID ($(stat -c%s "$APK") bytes)"
+
+# ...and its companion. The spoofed manager is only half the pair: mappings-spoofed is the table it
+# uses in place of the stock one. It was downloaded above (and its absence is now a hard failure
+# when the token is set), so it is delivered here too and the artifacts stay self-contained.
+if [ -f "$UD/mappings-spoofed.zip" ]; then
+  cp -f "$UD/mappings-spoofed.zip" "${GITHUB_WORKSPACE}/artifacts/${FILE_NAME}-mappings-spoofed.zip"
+  echo "shipping ${FILE_NAME}-mappings-spoofed.zip from CI run $CI_ID ($(stat -c%s "$UD/mappings-spoofed.zip") bytes)"
+fi
 
 # ksud is embedded in the manager APK as lib/arm64-v8a/libksud.so. The AnyKernel3 step copies
 # userspace/ksud into the zip and ksu-install.sh installs it to /data/adb/ksud during the flash -
