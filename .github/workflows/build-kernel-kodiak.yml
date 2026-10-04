@@ -128,6 +128,18 @@ on:
           - none
           - heybooboo-phase12
           - phase3
+      nomount:
+        description: 'Build NoMount (maxsteeel/nomount) into the kernel - a VFS path-redirection framework. Built-in support is what the NoMount metamodule probes for first ("nm version"); without it, on a custom kernel, it falls back to a pre-compiled LKM it may not have, which is exactly what "Kernel not patched or module failed to load" means. Independent of features.'
+        required: false
+        default: 'off'
+        type: choice
+        options:
+          - 'off'
+          - 'on'
+      nomount_commit:
+        description: 'NoMount commit to build. DEFAULT = the pinned latest on master (c5fad9d8f97c, 2026-10-01). Pass a full 40-char SHA to assert an exact revision; the run fails if HEAD does not match.'
+        required: false
+        default: 'c5fad9d8f97c5a207f7342fd91789449915ea047'
 
 jobs:
   build:
@@ -853,6 +865,79 @@ jobs:
           echo "ok: BORE in place (kernel/sched/bore.c, include/linux/sched/bore.h, KABI slots 4-7)"
           git diff --stat | tail -3
 
+      # ---------------------------------------------------------- 6e. NoMount (VFS redirection)
+      # NoMount (maxsteeel/nomount) is a VFS path-redirection framework: rather than mounting an
+      # overlay, it redirects paths at the VFS layer, so a systemless module's files appear in
+      # place without any mount. Its metamodule probes for BUILT-IN kernel support first
+      # ("$MODDIR/bin/nm version") and only falls back to a pre-compiled LKM. On a custom kernel
+      # neither exists unless the kernel carries it - which is precisely what its
+      # "Kernel not patched or module failed to load" description means.
+      #
+      # Integration is deliberately trivial and touches NO existing source file: their own
+      # kernel/setup.sh copies kernel/src/ to fs/nomount/ and adds
+      #     fs/Kconfig : source "fs/nomount/Kconfig"
+      #     fs/Makefile: obj-$(CONFIG_NOMOUNT) += nomount/
+      # so unlike KernelSU/SUSFS/BORE there is nothing here that can conflict with a 6.12.69
+      # GKI tree. Their src/Kconfig has no select and no depends, so CONFIG_NOMOUNT=y is the
+      # whole config story (see nomount.config, applied two steps below).
+      #
+      # This is the LKM-vs-built-in distinction their README makes: GKI users can instead drop a
+      # pre-compiled nomount.ko into the module's lkm/ folder, but a custom kernel is exactly the
+      # case where built-in is the reliable option.
+      - name: "NoMount - integrate the VFS path redirection framework"
+        if: ${{ inputs.nomount == 'on' }}
+        run: |
+          set -o pipefail
+          cd "$GITHUB_WORKSPACE/kernel/common"
+          N="$GITHUB_WORKSPACE/nomount"
+          rm -rf "$N"
+          git clone --depth=1 https://github.com/maxsteeel/nomount "$N"
+          if [ -n "${{ inputs.nomount_commit }}" ]; then
+            git -C "$N" fetch --depth=1 origin "${{ inputs.nomount_commit }}" 2>/dev/null || true
+            if ! git -C "$N" checkout --quiet "${{ inputs.nomount_commit }}" 2>/dev/null; then
+              echo "::error::cannot check out NoMount ${{ inputs.nomount_commit }}"
+              git -C "$N" log --oneline -3 || true
+              exit 1
+            fi
+            got="$(git -C "$N" rev-parse HEAD)"
+            if [ "$got" != "${{ inputs.nomount_commit }}" ]; then
+              echo "::error::NoMount HEAD $got does not match the requested pin ${{ inputs.nomount_commit }}"
+              exit 1
+            fi
+            echo "NoMount pinned at $got ($(git -C "$N" log -1 --format=%cs))"
+          else
+            echo "NoMount at $(git -C "$N" rev-parse HEAD) ($(git -C "$N" log -1 --format=%cs)) - branch tip"
+          fi
+          echo "NOMOUNT_COMMIT=$(git -C "$N" rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
+          SRC="$N/kernel/src"
+          test -f "$SRC/nomount.c" || { echo "::error::$SRC/nomount.c is missing in this NoMount revision"; exit 1; }
+          mkdir -p fs/nomount
+          cp -f "$SRC"/* fs/nomount/
+          ls -la fs/nomount/
+
+          if grep -q 'nomount' fs/Makefile; then
+            echo "fs/Makefile already wired"
+          else
+            printf '\nobj-$(CONFIG_NOMOUNT) += nomount/\n' >> fs/Makefile
+            echo "wired fs/Makefile"
+          fi
+          if grep -q 'source "fs/nomount/Kconfig"' fs/Kconfig; then
+            echo "fs/Kconfig already wired"
+          else
+            awk '/^endmenu/ { last = NR } { l[NR] = $0 } END { for (i = 1; i <= NR; i++) { if (i == last) print "source \"fs/nomount/Kconfig\""; print l[i] } }' fs/Kconfig > fs/Kconfig.tmp && mv fs/Kconfig.tmp fs/Kconfig
+            echo "wired fs/Kconfig"
+          fi
+
+          # post-conditions: the sources are in place and each wiring line is exactly once
+          test -f fs/nomount/nomount.c || { echo "::error::fs/nomount/nomount.c is not in place"; exit 1; }
+          test -f fs/nomount/nomount.h || { echo "::error::fs/nomount/nomount.h is not in place"; exit 1; }
+          n="$(grep -c 'obj-$(CONFIG_NOMOUNT) += nomount/' fs/Makefile || true)"
+          [ "$n" = "1" ] || { echo "::error::fs/Makefile wiring is wrong (found $n)"; exit 1; }
+          n="$(grep -c 'source "fs/nomount/Kconfig"' fs/Kconfig || true)"
+          [ "$n" = "1" ] || { echo "::error::fs/Kconfig wiring is wrong (found $n)"; exit 1; }
+          echo "ok: NoMount integrated (fs/nomount/, fs/Makefile, fs/Kconfig)"
+
       # ------------------------------------------------------------------- 7. config
       # The canonical list lives in .github/scripts/kodiak/susfs.config (same file the phone-2a
       # pipeline uses) so the options are reviewable in git rather than buried in YAML.
@@ -968,6 +1053,18 @@ jobs:
               apply_line "$line" || { echo "::error::could not apply bore line: [$line]"; exit 1; }
             done < "$GITHUB_WORKSPACE/.github/scripts/kodiak/bore.config"
             grep -n '^CONFIG_SCHED_BORE=' "$DEFCONFIG" || echo "::warning::CONFIG_SCHED_BORE did not take in the defconfig"
+          fi
+
+          # ---------------------------------------------------------------------------
+          # NOMOUNT (independent of features): the symbol only exists because the NoMount
+          # step copied fs/nomount/Kconfig into the tree and wired it into fs/Kconfig.
+          # ---------------------------------------------------------------------------
+          if [ "${{ inputs.nomount }}" = "on" ]; then
+            echo "--- applying .github/scripts/kodiak/nomount.config ---"
+            while IFS= read -r line || [ -n "$line" ]; do
+              apply_line "$line" || { echo "::error::could not apply nomount line: [$line]"; exit 1; }
+            done < "$GITHUB_WORKSPACE/.github/scripts/kodiak/nomount.config"
+            grep -n '^CONFIG_NOMOUNT=' "$DEFCONFIG" || echo "::warning::CONFIG_NOMOUNT did not take in the defconfig"
           fi
           grep -nE '^CONFIG_MODULE_(ALLOW_BTF_MISMATCH|SCMVERSION)|^# CONFIG_MODULE_SIG_PROTECT is not set' "$DEFCONFIG" || true
           # Report rather than fail: if this ACK tree has no such symbol the line is inert, and
