@@ -129,6 +129,7 @@ on:
           - heybooboo-phase12
           - phase3
           - phase4
+          - phase5
       nomount_commit:
         description: 'NoMount is ALWAYS built in. By default the latest commit on master is used - leave this empty. Pass a full 40-char SHA only to assert an exact revision; the run then fails if HEAD does not match.'
         required: false
@@ -859,7 +860,7 @@ jobs:
         # Cumulative, not exclusive: features=phase4 means "everything", so a phase-4 build still
         # carries BORE. That is what lets one dispatch end with the whole feature set instead of
         # trading phase 4 for phase 3 (run #43 was built without BORE for exactly that reason).
-        if: ${{ inputs.features == 'phase3' || inputs.features == 'phase4' }}
+        if: ${{ inputs.features == 'phase3' || inputs.features == 'phase4' || inputs.features == 'phase5' }}
         run: |
           set -o pipefail
           cd "$GITHUB_WORKSPACE/kernel/common"
@@ -922,7 +923,7 @@ jobs:
       # Their arch/arm64/configs/heybooboo_gki.fragment change is theirs alone and is excluded; its
       # content is reproduced as baseband.config by the config step.
       - name: "Features - phase 4: baseband-guard LSM"
-        if: ${{ inputs.features == 'phase4' }}
+        if: ${{ inputs.features == 'phase4' || inputs.features == 'phase5' }}
         run: |
           set -o pipefail
           cd "$GITHUB_WORKSPACE/kernel/common"
@@ -954,6 +955,43 @@ jobs:
           n="$(grep -c 'obj-$(CONFIG_BBG) += baseband-guard/' security/Makefile || true)"
           [ "$n" = "1" ] || { echo "::error::security/Makefile wiring is wrong (found $n)"; exit 1; }
           echo "ok: baseband-guard LSM integrated (16 files, slot reserved, security/{Kconfig,Makefile} wired)"
+
+      # ------------------------------------------------------- 6f. phase 5: arm64 memcmp/memcpy
+      # Two assembly files, no config, no rebase - both apply cleanly to this tree (verified offline
+      # with mock_apply --shas against the phase-4 tree, every post-condition holding).
+      #   4754a780f7  arch/arm64/lib/memcmp.S        - newer optimized-routines memcmp
+      #   c252209f56  arch/arm64/lib/copy_template.S - prefetch source cache lines in memcpy
+      # Boot-critical code, so the post-conditions are git's own: after applying, each file must report
+      # as modified. An apply that "succeeded" without changing anything is the failure that would
+      # otherwise only surface as a two-hour build that behaves exactly like the previous kernel.
+      - name: "Features - phase 5: arm64 memcmp/memcpy"
+        if: ${{ inputs.features == 'phase5' }}
+        run: |
+          set -o pipefail
+          cd "$GITHUB_WORKSPACE/kernel/common"
+          FEAT_REPO="asdfmonster261/heybooboo-kernel"
+          TMP="$(mktemp -d)"
+          for SHA in 4754a780f7 c252209f56; do
+          P="$TMP/$SHA.patch"
+          curl -fsSL "https://github.com/$FEAT_REPO/commit/$SHA.patch" -o "$P" \
+          || { echo "::error::cannot download $FEAT_REPO commit $SHA"; exit 1; }
+          echo "--- $SHA  $(sed -n 's/^Subject: \[PATCH\] //p' "$P" | head -1)"
+          if ! git apply --check "$P" 2>"$TMP/err"; then
+          echo "::error::$SHA does not apply cleanly to this tree:"
+          sed -n '1,6p' "$TMP/err"
+          exit 1
+          fi
+          git apply "$P"
+          done
+          for f in arch/arm64/lib/memcmp.S arch/arm64/lib/copy_template.S; do
+          test -f "$f" || { echo "::error::$f is missing after the phase-5 patches"; exit 1; }
+          if git diff --quiet -- "$f"; then
+          echo "::error::$f is unchanged - its patch did not take"
+          exit 1
+          fi
+          echo "ok: $f modified"
+          done
+          echo "ok: arm64 memcmp/memcpy updated (boot-critical; verified by git diff, so a build follows)"
 
       - name: "NoMount - integrate the VFS path redirection framework"
         run: |
@@ -1120,7 +1158,7 @@ jobs:
           # phase3 OR phase4: phase 4 is a superset (see the BORE step), so its build needs
           # CONFIG_SCHED_BORE too - otherwise the BORE code is compiled in but its config, which is
           # what the sysctl /proc/sys/kernel/sched_bore depends on, silently would not be.
-          if [ "${{ inputs.features }}" = "phase3" ] || [ "${{ inputs.features }}" = "phase4" ]; then
+          if [ "${{ inputs.features }}" = "phase3" ] || [ "${{ inputs.features }}" = "phase4" ] || [ "${{ inputs.features }}" = "phase5" ]; then
             echo "--- applying .github/scripts/kodiak/bore.config (phase 3) ---"
             while IFS= read -r line || [ -n "$line" ]; do
               apply_line "$line" || { echo "::error::could not apply bore line: [$line]"; exit 1; }
@@ -1136,7 +1174,7 @@ jobs:
           # already lists instead of replacing it: the stock string also carries `integrity`, and
           # dropping it would be a silent behavioural change nothing else would notice.
           # ---------------------------------------------------------------------------
-          if [ "${{ inputs.features }}" = "phase4" ]; then
+          if [ "${{ inputs.features }}" = "phase4" ] || [ "${{ inputs.features }}" = "phase5" ]; then
             echo "--- applying .github/scripts/kodiak/baseband.config (phase 4) ---"
             while IFS= read -r line || [ -n "$line" ]; do
               apply_line "$line" || { echo "::error::could not apply baseband line: [$line]"; exit 1; }
