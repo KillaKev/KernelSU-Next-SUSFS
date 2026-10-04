@@ -1270,6 +1270,55 @@ jobs:
           fi
           ls -la "$A" | head -25 || true
 
+          # ---------------------------------------------------------------------------------
+          # SHIP THE MATCHING KERNELSU USERSPACE (RUN #24-#26 LESSON).
+          # Our kernel reports KernelSU-Next 33318 (v3.4.0) while the phone carries
+          # ksud 3.3.0-41-g39ba3821, so the kernel's version handshake fails and `su` never
+          # appears: root was inert in every flash. Without root, the kernel's module-refusal
+          # messages (dmesg) are unreadable - which is exactly what blocked the module diagnosis.
+          # WildKernels' AK3 solves this by shipping the userspace; ours only shipped the Image.
+          # So: fetch the pinned manager APK, verify it by SHA256, lift ksud out of it (the APK
+          # embeds it as lib/arm64-v8a/libksud.so) and have anykernel.sh install it to
+          # /data/adb/ksud at flash time, because the AK3 runs as root inside the flasher.
+          # ---------------------------------------------------------------------------------
+          KSU_APK_URL="https://github.com/KernelSU-Next/KernelSU-Next/releases/download/v3.4.0/KernelSU_Next_v3.4.0_33294-release.apk"
+          KSU_APK_SHA="50339A93C0F812B8A72C1A387A1B441891E3DF0F20B2D9DAF80FD798D04B3DE8"
+          KSUD_SHA="C305965796AFB55AE8DAD3A122935C995A818E07C637A9EF4C3E375202E4A427"
+          curl -LSs -o /tmp/ksu-manager.apk "$KSU_APK_URL"
+          GOT=$(sha256sum /tmp/ksu-manager.apk | awk '{print toupper($1)}')
+          if [ "$GOT" != "$KSU_APK_SHA" ]; then
+            echo "::error::manager APK hash mismatch: got $GOT want $KSU_APK_SHA"
+            exit 1
+          fi
+          echo "manager APK verified: $GOT"
+          unzip -o -j /tmp/ksu-manager.apk 'lib/arm64-v8a/libksud.so' -d /tmp >/dev/null
+          mv /tmp/libksud.so "$A/ksud"
+          chmod 0755 "$A/ksud"
+          KSUD_GOT=$(sha256sum "$A/ksud" | awk '{print toupper($1)}')
+          if [ "$KSUD_GOT" != "$KSUD_SHA" ]; then
+            echo "::error::extracted ksud hash mismatch: got $KSUD_GOT want $KSUD_SHA"
+            exit 1
+          fi
+          echo "ksud verified: $KSUD_GOT  ($(stat -c%s "$A/ksud") bytes)"
+          file "$A/ksud" || true
+
+          # Install it during the flash. The fragment is PREPENDED to anykernel.sh right after its
+          # shebang so it always runs before the AK3 flow and cannot be skipped by an early exit.
+          # It lives in .github/scripts/kodiak/ksu-install.sh rather than inline here: shell code
+          # inside a YAML block scalar must be indented, and a flush-left heredoc body silently
+          # terminates the scalar (that broke this workflow once already).
+          KSI="$GITHUB_WORKSPACE/.github/scripts/kodiak/ksu-install.sh"
+          test -f "$KSI" || { echo "::error::$KSI missing - cannot install the KSU userspace"; exit 1; }
+          head -1 "$A/anykernel.sh"    > /tmp/ak-new.sh
+          cat "$KSI"                  >> /tmp/ak-new.sh
+          tail -n +2 "$A/anykernel.sh" >> /tmp/ak-new.sh
+          mv /tmp/ak-new.sh "$A/anykernel.sh"
+          chmod 0755 "$A/anykernel.sh"
+          grep -q 'pixel11 CI ksud install' "$A/anykernel.sh" \
+            || { echo "::error::ksud install block did not land in anykernel.sh"; exit 1; }
+          echo "anykernel.sh patched; first 4 lines:"; head -4 "$A/anykernel.sh" || true
+          ls -la "$A/ksud" "$A/anykernel.sh"
+
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
           ( cd "$A" && zip -r -9 "$GITHUB_WORKSPACE/artifacts/${FILE_NAME}-AnyKernel3.zip" . -x '.git/*' -x '.git' >/dev/null )
           cp "$K/Image"     "$GITHUB_WORKSPACE/artifacts/${FILE_NAME}-Image"
