@@ -696,18 +696,17 @@ jobs:
               fi
               TOUCHED="$TOUCHED $F"
             done
-            # Line counts, cumulative, and only inside hunks. Both details were earned by
-            # validating this step offline against all 16 patches before running it:
-            #   * outside hunks a commit message with "- " bullets reads as deletions
-            #     (binfmt_misc ba822aad8d and 3f8a7dbc0c each lose 2)
-            #   * a bare "+" line is a real added line that git counts, so match git's
-            #     counting, not grep's; and accumulate, because this diff is against HEAD
-            #     (the loop applies 16 patches, not one)
-            # -- TOUCHED also keeps unrelated dirty files (the SUSFS tree copy and the
-            # KernelSU-Next install, which are new files under different paths) out of the
-            # count. None of the 16 patches touches a file either of those steps writes.
-            PA="$(awk '/^diff --git/{h=0} /^@@ /{h=1;next} h&&/^\+/{a++} END{print a+0}' "$P")"
-            PD="$(awk '/^diff --git/{h=0} /^@@ /{h=1;next} h&&/^-/{d++} END{print d+0}' "$P")"
+            # Line counts: git's own count of what this patch adds, against git's own count
+            # of what the tree now has. Two failures were needed to get here, both caught
+            # before they could cost a build:
+            #   * run #31: grep -c '^+[^+]' skips a bare "+" line, so ntsync read 883 not 1041
+            #   * run #33: counting the patch file counts the --exclude'd file too, so the
+            #     ntsync patch read +1082 while the tree gained 1081
+            # `git apply --numstat` honours --exclude and counts exactly like git does, so the
+            # two sides are now the same tool. Accumulated, because the diff is against HEAD.
+            read -r PA PD <<EOF
+          $(git apply --numstat $EXCL "$P" | awk '{a+=$1; d+=$2} END{print a+0, d+0}')
+          EOF
             TOTA=$((TOTA + PA)); TOTD=$((TOTD + PD))
             git add -A -- $TOUCHED
             GOTA="$(git diff --cached --numstat -- $TOUCHED | awk '{a+=$1} END{print a+0}')"
