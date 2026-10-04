@@ -724,7 +724,13 @@ jobs:
           4a540de15a|req||usb: typec: tcpm - register DRP for sink-clobbered dual-role ports (the kernel half of USB-OTG host in recovery/fastbootd; inert on a normal boot)
           cb00795956|req|--exclude=arch/arm64/configs/heybooboo_gki.fragment|misc: ntsync - replace the 6.10 stub with the completed driver (CONFIG_NTSYNC in tuning.config)
           584b8b68ff|req||net: tcp: backport BBRv3 congestion control (13 files, +2682; the new tcp_sock fields sit in a union with __kabi_ignored_0 so tcp_sock keeps its size and offsets)
-          7bb1c30747|req||f2fs: shorten congestion wait to 6ms
+          # 7bb1c30747 (f2fs: shorten congestion wait to 6ms) is NOT in this list: it is the
+          # one required patch that does not fit 6.12.69. mock_apply.py says why in a line -
+          # "patch failed: fs/f2fs/f2fs.h:638" - their 6.12.93 tree has MAX_FLUSH_RETRY_COUNT
+          # between the anchor lines where 6.12.69 has DEFAULT_RETRY_IO_COUNT and
+          # DEFAULT_RETRY_QUOTA_FLUSH_COUNT, so git's context check fails even though the two
+          # changed lines are identical. It is hand-ported in the next step (that change is
+          # the whole patch: +2/-2).
           08682bf70e|req||f2fs: shorten urgent GC sleep to 50ms
           6fc1453e7d|req||f2fs: raise DEF_MIN_FSYNC_BLOCKS to 20
           0d960a53d0|req||fs: lower default vfs_cache_pressure to 50
@@ -746,6 +752,54 @@ jobs:
           fi
           echo "FEATURES=heybooboo-phase12 applied=$N skipped=${NSKIP}${SKIPPED}" >> "$GITHUB_ENV"
           git diff --stat | tail -3
+
+      # ------------------------------ 6c. the one required patch that needs a hand-port
+      # 7bb1c30747 (f2fs: shorten congestion wait to 6ms) is the only required patch that
+      # does not apply to this tree, and mock_apply.py says why in one line:
+      #     error: patch failed: fs/f2fs/f2fs.h:638
+      # Their 6.12.93 tree has MAX_FLUSH_RETRY_COUNT between the anchor lines where 6.12.69
+      # has DEFAULT_RETRY_IO_COUNT / DEFAULT_RETRY_QUOTA_FLUSH_COUNT, so git's context check
+      # fails even though the two changed lines are byte-identical. Those two lines are the
+      # whole patch (+2/-2), so a targeted edit is exact rather than approximate - and it
+      # asserts its own pre- and post-conditions either side of the edit.
+      #
+      # Verified against the real file before being trusted: f2fs_h_6.12.69.h (fetched from
+      # android16-6.12.69_r00, sha256 5bea914af9638107...) through f2fs_port_test.sh shows
+      # exactly two changed lines and the original tabs intact.
+      #
+      # The patterns are deliberately tab-free: a literal tab in YAML is a hazard, and \1/\2
+      # are followed by letters so they cannot be misread as backreference 16.
+      - name: Features - hand-port the f2fs congestion fixup that 6.12.69 moved
+        if: ${{ inputs.features == 'heybooboo-phase12' }}
+        run: |
+          set -o pipefail
+          cd "$GITHUB_WORKSPACE/kernel/common"
+          F=fs/f2fs/f2fs.h
+          b1="$(grep -c 'DEFAULT_IO_TIMEOUT.*msecs_to_jiffies(20)' "$F" || true)"
+          b2="$(grep -c 'congestion wait timeout value, default: 20ms' "$F" || true)"
+          echo "before: $F  DEFAULT_IO_TIMEOUT@20ms=$b1  comment@20ms=$b2"
+          if [ "$b1" != "1" ] || [ "$b2" != "1" ]; then
+            echo "::error::expected exactly one of each in $F - this tree is not the one the hand-port was written against"
+            grep -n 'DEFAULT_IO_TIMEOUT\|congestion wait timeout' "$F" | head -10 || true
+            exit 1
+          fi
+          sed -i 's|^#define\([[:space:]]*\)DEFAULT_IO_TIMEOUT\([[:space:]]*\)(msecs_to_jiffies(20))|#define\1DEFAULT_IO_TIMEOUT\2(msecs_to_jiffies(6))|' "$F"
+          sed -i 's|congestion wait timeout value, default: 20ms|congestion wait timeout value, default: 6ms|' "$F"
+          a1="$(grep -c 'DEFAULT_IO_TIMEOUT.*msecs_to_jiffies(20)' "$F" || true)"
+          a2="$(grep -c 'DEFAULT_IO_TIMEOUT.*msecs_to_jiffies(6)' "$F" || true)"
+          a3="$(grep -c 'congestion wait timeout value, default: 6ms' "$F" || true)"
+          echo "after : 20ms=$a1  6ms=$a2  comment-6ms=$a3"
+          if [ "$a1" != "0" ] || [ "$a2" != "1" ] || [ "$a3" != "1" ]; then
+            echo "::error::the f2fs hand-port did not land exactly once"
+            exit 1
+          fi
+          # Prove the tab survived. printf supplies the tab, so no literal tab is needed
+          # anywhere in this file.
+          if ! grep -n 'DEFAULT_IO_TIMEOUT.*msecs_to_jiffies(6)' "$F" | grep -q "$(printf 'DEFAULT_IO_TIMEOUT\t')"; then
+            echo "::error::the tab before (msecs_to_jiffies(6)) was lost - the define would still work, but it is not the change that was reviewed"
+            exit 1
+          fi
+          echo "ok: f2fs DEFAULT_IO_TIMEOUT 20ms -> 6ms, tabs intact (hand-port of 7bb1c30747)"
 
       # ------------------------------------------------------------------- 7. config
       # The canonical list lives in .github/scripts/kodiak/susfs.config (same file the phone-2a
