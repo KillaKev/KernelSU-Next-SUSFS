@@ -1662,13 +1662,33 @@ jobs:
             find bazel-bin -maxdepth 4 -name 'vmlinux*' 2>/dev/null | head -10 || true
             exit 1
           fi
-          OC="$(command -v llvm-objcopy || command -v objcopy || true)"
-          if [ -z "$OC" ]; then
-            echo "::error::neither llvm-objcopy nor objcopy is on this runner"
-            exit 1
-          fi
-          ls -la "$VM"
-          "$OC" -O binary --only-section=.BTF "$VM" "$GITHUB_WORKSPACE/artifacts/${FILE_NAME}-BTF"
+          # Extract .BTF with python3, not objcopy. Run #34 proved why: the host
+          # /usr/bin/objcopy is x86 binutils and answers "Unable to recognise the format of
+          # the input file" for an aarch64 ELF, and llvm-objcopy is not in PATH on the
+          # runner (it lives in kleaf's downloaded clang prebuilts). Reading the ELF
+          # section table directly is 12 lines, needs no toolchain, and cannot drift.
+          python3 - "$VM" "$GITHUB_WORKSPACE/artifacts/${FILE_NAME}-BTF" <<'PY'
+          import struct, sys
+          src, dst = sys.argv[1], sys.argv[2]
+          data = open(src, 'rb').read()
+          if data[:4] != b'\x7fELF' or data[4] != 2 or data[5] != 1:
+              sys.exit('not a 64-bit little-endian ELF: ' + src)
+          shoff, = struct.unpack_from('<Q', data, 0x28)
+          shentsize, shnum, shstrndx = struct.unpack_from('<HHH', data, 0x3A)
+          stroff, strsize = struct.unpack_from('<QQ', data, shoff + shstrndx * shentsize + 0x18)
+          strtab = data[stroff:stroff + strsize]
+          for i in range(shnum):
+              base = shoff + i * shentsize
+              name_off, = struct.unpack_from('<I', data, base)
+              off, size = struct.unpack_from('<QQ', data, base + 0x18)
+              name = strtab[name_off:strtab.find(b'\0', name_off)].decode('utf-8', 'replace')
+              if name == '.BTF':
+                  open(dst, 'wb').write(data[off:off + size])
+                  print('wrote %s: %d bytes' % (dst, size))
+                  break
+          else:
+              sys.exit('no .BTF section in ' + src)
+          PY
           ls -la "$GITHUB_WORKSPACE/artifacts/${FILE_NAME}-BTF"
           # A BTF blob starts with the magic 0xEB9F, little-endian: 9f eb
           MAGIC="$(od -An -tx1 -N2 "$GITHUB_WORKSPACE/artifacts/${FILE_NAME}-BTF" | tr -d ' \n')"
@@ -1679,6 +1699,10 @@ jobs:
           echo "BTF magic OK - feed this file to: python btf_structs.py diff <baseline> <this file>"
 
       - name: Upload artifacts
+        # RUN #34 LESSON: this had no `always()`, so when the .BTF step failed the whole
+        # build (Image, Image.lz4, boot.img and the AnyKernel3 zip - 28 minutes of it) was
+        # thrown away with it. A late gate must never be able to discard a good build.
+        if: ${{ always() && hashFiles('artifacts/*') != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.FILE_NAME }}
