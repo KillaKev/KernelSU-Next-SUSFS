@@ -1,0 +1,94 @@
+name: Build OrangeFox recovery (flashable vendor_boot) - Pixel 11 family
+
+# WHAT THIS PRODUCES
+#   OrangeFox-<device>-vendor_boot.img, a COMPLETE vendor_boot you flash directly:
+#       fastboot flash vendor_boot OrangeFox-kodiak-vendor_boot.img
+#   No AnyKernel3, no kernel flasher, and it does not touch `boot` - so a KernelSU kernel on the
+#   phone is unaffected.
+#
+# WHY IT IS BUILT HERE AND NOT ON A PC
+#   The graft needs magiskboot. The project ships it as the arm64 build from Magisk (a static
+#   binary, which is why it runs outside Android at all). On a Linux runner the x86_64 build from
+#   the same APK is used; a Windows box without WSL can execute neither, and the phone lacks curl
+#   and xz. ubuntu-latest has exactly what the script expects.
+#
+# WHY THE SCRIPT IS PATCHED, AND ONLY IN ONE PLACE
+#   create-orangefox-yogi.sh ends with a post-repack sanity check on init.recovery.yogi.rc, while
+#   this tree carries init.recovery.kodiak.rc for kodiak just the same. With --device kodiak that
+#   check would refuse a perfectly good image, so it is made device-agnostic here - one sed, with
+#   the result asserted - rather than vendoring a fork of the script that would go stale.
+on:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: 'Device codename (kodiak = Pixel 11 Pro XL)'
+        required: true
+        default: 'kodiak'
+      build:
+        description: 'Google build ID whose stock vendor_boot is used (must be listed on the OTA page)'
+        required: true
+        default: 'CD1A.260905.001.B1'
+      raw:
+        description: 'Optional: an OrangeFox raw two-fragment vendor_boot to use instead of releases/latest'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Show the request
+        run: |
+          echo "device : ${{ inputs.device }}"
+          echo "build  : ${{ inputs.build }}"
+          echo "raw    : ${{ inputs.raw }}"
+
+      - name: Fetch the project's client script and patch its device-specific check
+        run: |
+          set -o pipefail
+          curl -fsSL -o create.sh \
+            https://raw.githubusercontent.com/asdfmonster261/yogi-orangefox/main/create-orangefox-yogi.sh
+          test -s create.sh
+          echo "script lines: $(wc -l < create.sh)"
+          sed -i "s/init\.recovery\.yogi\.rc/init.recovery.${{ inputs.device }}.rc/g" create.sh
+          n="$(grep -c "init\.recovery\.${{ inputs.device }}\.rc" create.sh || true)"
+          [ "$n" -ge 1 ] || { echo "::error::the device-agnostic patch did not land - the script changed upstream?"; grep -n 'init.recovery' create.sh || true; exit 1; }
+          chmod +x create.sh
+          echo "patched: $n reference(s) now name init.recovery.${{ inputs.device }}.rc"
+
+      - name: Check the tools the script needs are present
+        run: |
+          for t in curl xz dd od awk unzip sha256sum python3 file; do
+            printf '  %-10s %s\n' "$t" "$(command -v "$t" || echo MISSING)"
+          done
+
+      - name: Build the flashable vendor_boot
+        run: |
+          set -o pipefail
+          OUT="OrangeFox-${{ inputs.device }}-vendor_boot.img"
+          if [ -n "${{ inputs.raw }}" ]; then
+            bash create.sh --device "${{ inputs.device }}" --build "${{ inputs.build }}" --raw "${{ inputs.raw }}" --out "$OUT"
+          else
+            bash create.sh --device "${{ inputs.device }}" --build "${{ inputs.build }}" --out "$OUT"
+          fi
+          test -f "$OUT" || { echo "::error::the script produced no $OUT"; exit 1; }
+          ls -l "$OUT"
+          sha256sum "$OUT" | tee "$OUT.sha256"
+          SZ="$(stat -c%s "$OUT")"
+          echo "size: $SZ bytes"
+          # An assembled vendor_boot is a few MiB up to ~100 MiB. A few hundred KB means the graft
+          # did not happen; >128 MiB means something was pasted together by accident.
+          [ "$SZ" -gt 4194304 ] || { echo "::error::$OUT is only $SZ bytes - too small to be an assembled vendor_boot"; exit 1; }
+          [ "$SZ" -lt 134217728 ] || { echo "::error::$OUT is $SZ bytes - implausibly large"; exit 1; }
+
+      - name: Upload the image
+        if: ${{ always() && hashFiles('OrangeFox-*.img') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: OrangeFox-${{ inputs.device }}-vendor_boot
+          path: |
+            OrangeFox-*.img
+            OrangeFox-*.sha256
+          if-no-files-found: error
+          compression-level: 0
