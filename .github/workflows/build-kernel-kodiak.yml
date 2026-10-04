@@ -756,39 +756,37 @@ jobs:
           # list of SYMBOLS. So: find the file that actually carries them (>=3 of the known
           # symbols, so driver sources like net/rfkill/core.c cannot match), SHOW it, and EMPTY it.
           # ---------------------------------------------------------------------------
-          echo "=== protected-exports files in the tree ==="
-          PSYMS="rfkill_alloc arc4_crypt generic_mii_ioctl slhc_compress tipc_dump_done pps_event lowpan_nhc_add wpan_phy_find l2tp_recv_common wwan_create_port"
-          PFILES="$(grep -rl --include='*' -F -e rfkill_alloc -e arc4_crypt -e slhc_compress \
-                     -e tipc_dump_done -e wpan_phy_find "$GITHUB_WORKSPACE/kernel/common" 2>/dev/null || true)"
-          FOUND_LIST=""
-          for pf in $PFILES; do
-            cnt=0
-            for s in $PSYMS; do
-              if grep -q -F "$s" "$pf" 2>/dev/null; then cnt=$((cnt+1)); fi
-            done
-            if [ "$cnt" -ge 3 ]; then
-              echo "  LIST CANDIDATE ($cnt/10 symbols): $pf  ($(wc -l < "$pf") lines, $(wc -c < "$pf") bytes)"
-              echo "    first 10 lines:"; head -10 "$pf" | sed 's/^/      /' || true
-              FOUND_LIST="$FOUND_LIST $pf"
-            fi
-          done
-          [ -n "$FOUND_LIST" ] || echo "  (no file carries >=3 of those symbols - the list must be generated)"
-          for pf in $FOUND_LIST; do
-            : > "$pf"
-            echo "  emptied: $pf -> $(wc -c < "$pf") bytes"
-          done
-
-          echo "=== files named like protected exports / abi lists (emptied where they are lists) ==="
+          # SURGICAL FIX. Run #29 taught the lesson: EMPTYING BUILD INPUTS BREAKS THE BOOT (and its
+          # Module.symvers shrank 633 -> 585 KB, i.e. the export set was damaged). The mechanism is
+          # explicit in the source:
+          #   config MODULE_SIG_PROTECT_LIST  string, default ""          <- empty means OFF
+          #   config MODULE_SIG_PROTECT       def_bool y, depends on MODULE_SIG_PROTECT_LIST != ""
+          #   kernel/module/main.c, verify_exported_symbols():
+          #     #ifdef CONFIG_MODULE_SIG_PROTECT
+          #         if (!mod->sig_ok && is_protected_symbol_export(kernel_symbol_name(s))) {
+          #             pr_err("%s: exports protected symbol %s\n", ...);
+          #             return -EACCES;      <- the refusal the modules hit
+          #         }
+          #     #endif
+          # The build injects the list value (kconfig ignores an empty string in the defconfig, which
+          # is why that attempt did nothing), so disable the CONDITION instead - a single-line change
+          # that leaves the helper function, its table and the duplicate-symbol check intact, so
+          # there is no dead code and no unused-symbol risk.
+          MSRC="$GITHUB_WORKSPACE/kernel/common/kernel/module/main.c"
+          if [ -f "$MSRC" ]; then
+            sed -i 's|if (!mod->sig_ok && is_protected_symbol_export(|if (false \&\& !mod->sig_ok \&\& is_protected_symbol_export(|' "$MSRC"
+            DIS=$(grep -c 'if (false && !mod->sig_ok && is_protected_symbol_export(' "$MSRC" || true)
+            echo "module/main.c: defused protected-export condition sites = ${DIS:-0}"
+            [ "${DIS:-0}" -ge 1 ] || { echo "::error::could not defuse the protected-export check in main.c"; exit 1; }
+            grep -n 'exports protected symbol' "$MSRC" | head -3 || true
+          else
+            echo "::error::$MSRC not found - cannot disable the protected-export refusal"
+            exit 1
+          fi
+          echo "=== files named like protected exports / abi lists (LISTED ONLY - never emptied) ==="
           find "$GITHUB_WORKSPACE/kernel" -maxdepth 6 -type f \
-            \( -name '*protected_exports*' -o -name '*protected_modules*' -o -name 'abi_gki_*' \
-               -o -name 'abi_symbollist*' \) -not -path '*/.git/*' 2>/dev/null | head -30 | while read -r pf; do
-              echo "  $pf  ($(wc -c < "$pf") bytes)"
-              case "$pf" in
-                *protected*)
-                  : > "$pf"
-                  echo "    -> emptied (it was a protected list)" ;;
-              esac
-            done || true
+            \( -name '*protected*' -o -name 'abi_gki_*' -o -name 'abi_symbollist*' \) \
+            -not -path '*/.git/*' -exec ls -la {} \; 2>/dev/null || true
 
           echo "=== the code that emits the refusal (patch material if emptying is not enough) ==="
           CODEF="$(grep -rl -F 'exports protected symbol' "$GITHUB_WORKSPACE/kernel/common" 2>/dev/null | head -3 || true)"
@@ -798,9 +796,8 @@ jobs:
             grep -n -B 8 -A 4 -F 'exports protected symbol' "$cf" || true
           done
 
-          # Persist the evidence where the ALWAYS-uploaded artifact can pick it up. GitHub truncates
-          # the step log into a stub, so findings printed only to stdout are effectively lost - that
-          # is exactly what happened with the earlier attempts. /tmp/config_smoke.log IS uploaded.
+          # Persist the evidence to a DEDICATED file: /tmp/config_smoke.log is overwritten by the
+          # later "prove the config builds" step, which is how the previous probe's output was lost.
           {
             echo "=== pixel11 protected-exports probe ==="
             echo "list candidates (>=3 known symbols): ${FOUND_LIST:-none}"
@@ -811,8 +808,8 @@ jobs:
               -not -path '*/.git/*' -exec ls -la {} \; 2>/dev/null || true
             echo "--- code context ---"
             for cf in $CODEF; do echo "### $cf"; grep -n -B 8 -A 4 -F 'exports protected symbol' "$cf" || true; done
-          } >> /tmp/config_smoke.log 2>&1 || true
-          echo "probe written to /tmp/config_smoke.log ($(wc -c < /tmp/config_smoke.log 2>/dev/null || echo 0) bytes)"
+          } >> /tmp/protect_probe.log 2>&1 || true
+          echo "probe written to /tmp/protect_probe.log ($(wc -c < /tmp/protect_probe.log 2>/dev/null || echo 0) bytes)"
 
           echo "--- KSU/SUSFS lines now in gki_defconfig ---"
           grep -nE '^CONFIG_KSU|^# CONFIG_KSU' "$DEFCONFIG" || echo "(none)"
@@ -1179,6 +1176,7 @@ jobs:
           path: |
             /tmp/build.log
             /tmp/config_smoke.log
+            /tmp/protect_probe.log
           if-no-files-found: ignore
           compression-level: 9
 
