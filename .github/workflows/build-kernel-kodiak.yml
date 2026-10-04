@@ -132,6 +132,14 @@ on:
         description: 'NoMount is ALWAYS built in. By default the latest commit on master is used - leave this empty. Pass a full 40-char SHA only to assert an exact revision; the run then fails if HEAD does not match.'
         required: false
         default: ''
+      ksu_userspace:
+        description: 'Ship the KernelSU-Next userspace that MATCHES this kernel. auto = resolve the latest upstream "Build Manager CI" run, gate KERNEL_SU_UAPI_VERSION against this kernel tree (a mismatch FAILS the run: kernel uapi 5 with a uapi 4 userspace is the 2026-10-04 outage where su never appeared and the AK3 payload was installing the stale release APK), and - when a KSU_CI_TOKEN secret exists - download its manager-spoofed artifact, lift lib/arm64-v8a/libksud.so out of it and install that to /data/adb/ksud during the flash. off = build the kernel only.'
+        required: false
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - off
 
 jobs:
   build:
@@ -431,10 +439,32 @@ jobs:
           grep -n 'kernelsu' "$GITHUB_WORKSPACE/kernel/common/drivers/Makefile" \
                             "$GITHUB_WORKSPACE/kernel/common/drivers/Kconfig" || true
 
-      # The API contract that must hold before we spend two hours compiling:
-      #   KernelSU side -> does the fork declare the SUSFS options at all?
-      # (all of CONFIG_KSU_SUSFS* is *selected by* that declaration; without it kconfig silently
-      # drops our fragment lines and we would ship a kernel whose SUSFS hooks go nowhere.)
+        # --------------------------------------------- 5b. THE USERSPACE MUST MATCH THE KERNEL
+        # KernelSU's kernel<->userspace contract is KERNEL_SU_UAPI_VERSION, and a mismatch is
+        # silent until you go looking for `su`. On 2026-10-04 this kernel declared 5 while the
+        # phone - and, worse, this workflow's OWN AnyKernel3 payload (a hard-pinned v3.4.0 release
+        # APK, uapi 4) - carried 4, so the phone came up with no root and no dmesg to say why. The
+        # pair is therefore resolved HERE, before the two-hour build, from source files only
+        # (nothing aarch64 runs on this x86 runner): the kernel's own uapi/supercall.h against the
+        # same file at the head of the latest upstream 'Build Manager CI' run. Disagreement stops
+        # the build, because that kernel could not be rooted. Logic lives in
+        # .github/scripts/kodiak/ksu-userspace.sh so it is reviewable and testable on its own.
+      - name: KernelSU-Next userspace - resolve the CI pair and gate on uapi
+        if: ${{ inputs.patches != 'none' && inputs.ksu_userspace != 'off' }}
+        env:
+        # Optional. GitHub requires a token even for a PUBLIC repo's artifact zip, so without
+        # this secret the gate still runs but the matching userspace cannot be downloaded.
+          KSU_CI_TOKEN: ${{ secrets.KSU_CI_TOKEN }}
+        run: |
+          set -o pipefail
+          S=".github/scripts/kodiak/ksu-userspace.sh"
+          test -f "$S" || { echo "::error::$S is missing - it must be published with the workflow"; exit 1; }
+          bash "$S"
+
+        # The API contract that must hold before we spend two hours compiling:
+        #   KernelSU side -> does the fork declare the SUSFS options at all?
+        # (all of CONFIG_KSU_SUSFS* is *selected by* that declaration; without it kconfig silently
+        # drops our fragment lines and we would ship a kernel whose SUSFS hooks go nowhere.)
       - name: Gate - SUSFS is wired into KernelSU-Next
         if: ${{ inputs.patches == 'ksu-susfs' }}
         run: |
@@ -1723,26 +1753,23 @@ jobs:
           # embeds it as lib/arm64-v8a/libksud.so) and have anykernel.sh install it to
           # /data/adb/ksud at flash time, because the AK3 runs as root inside the flasher.
           # ---------------------------------------------------------------------------------
-          KSU_APK_URL="https://github.com/KernelSU-Next/KernelSU-Next/releases/download/v3.4.0/KernelSU_Next_v3.4.0_33294-release.apk"
-          KSU_APK_SHA="50339A93C0F812B8A72C1A387A1B441891E3DF0F20B2D9DAF80FD798D04B3DE8"
-          KSUD_SHA="C305965796AFB55AE8DAD3A122935C995A818E07C637A9EF4C3E375202E4A427"
-          curl -LSs -o /tmp/ksu-manager.apk "$KSU_APK_URL"
-          GOT=$(sha256sum /tmp/ksu-manager.apk | awk '{print toupper($1)}')
-          if [ "$GOT" != "$KSU_APK_SHA" ]; then
-            echo "::error::manager APK hash mismatch: got $GOT want $KSU_APK_SHA"
-            exit 1
-          fi
-          echo "manager APK verified: $GOT"
-          unzip -o -j /tmp/ksu-manager.apk 'lib/arm64-v8a/libksud.so' -d /tmp >/dev/null
-          mv /tmp/libksud.so "$A/ksud"
+          # THE PINNED v3.4.0 APK *WAS* THE MISMATCH. It is a uapi 4 build; this kernel is built
+          # from dev-susfs HEAD and declares uapi 5 - so every AK3 flash installed a ksud the
+          # kernel would not talk to and the phone came up without su (run #38, 2026-10-04).
+          # The userspace now comes from userspace/ksud, filled in by the gate step above, which
+          # resolved the latest upstream Build Manager CI run AND proved its uapi equals this
+          # kernel's. The hash pins are gone on purpose: a hard-coded hash cannot follow a moving
+          # KernelSU, and keeping one is exactly what pinned us to a stale userspace. Provenance
+          # is the CI run id/sha plus the uapi gate, and the run summary records both.
+          if [ -f "$GITHUB_WORKSPACE/userspace/ksud" ]; then
+          cp -f "$GITHUB_WORKSPACE/userspace/ksud" "$A/ksud"
           chmod 0755 "$A/ksud"
-          KSUD_GOT=$(sha256sum "$A/ksud" | awk '{print toupper($1)}')
-          if [ "$KSUD_GOT" != "$KSUD_SHA" ]; then
-            echo "::error::extracted ksud hash mismatch: got $KSUD_GOT want $KSUD_SHA"
-            exit 1
+          echo "ksud from CI run ${KSU_CI_ID:-?} (uapi ${KSU_CI_UAPI:-?}): $(stat -c%s "$A/ksud") bytes, sha256 $(sha256sum "$A/ksud" | awk '{print $1}')"
+          else
+          echo "::warning::no matching userspace was fetched, so this AK3 zip ships the Image only."
+          echo "::warning::after flashing, install 'manager-spoofed' from ${KSU_CI_URL:-the KernelSU-Next CI} by hand - never an older manager, that is what breaks root."
           fi
-          echo "ksud verified: $KSUD_GOT  ($(stat -c%s "$A/ksud") bytes)"
-          file "$A/ksud" || true
+
 
           # Install it during the flash. The fragment is PREPENDED to anykernel.sh right after its
           # shebang so it always runs before the AK3 flow and cannot be skipped by an early exit.
@@ -1882,6 +1909,7 @@ jobs:
             echo "| Device | Pixel 11 Pro XL (**kodiak**, Tensor G6) |"
             echo "| Features | \`${{ inputs.features }}\` (heybooboo port: containers/SysV IPC, ntsync, BBRv3, qdiscs, netfilter/ipset, f2fs/vfs/int_sqrt, tcpm DRP; \`none\` = run #30) |"
             echo "| NoMount | always built in from maxsteeel/nomount @ ${NOMOUNT_COMMIT:-latest master} (CONFIG_NOMOUNT=y, VFS path redirection) |"
+            echo "| Userspace | KernelSU-Next \\`KERNEL_SU_UAPI_VERSION\\` = ${KSU_UAPI:-?} | latest Build Manager CI \\`${KSU_CI_SHA:-not resolved}\\` (uapi ${KSU_CI_UAPI:-?}, ${KSU_CI_DATE:-?}) - run ${KSU_CI_ID:-n/a} |"
             echo "| ACK branch | \`${{ inputs.kernel_branch }}\` |"
             echo "| KMI | android16-6.12 (sublevel ${{ inputs.expected_sublevel }}) |"
             echo "| Device patch level | ${{ inputs.os_patch_level }} |"
@@ -1898,6 +1926,9 @@ jobs:
             echo "0c. **What run #35 measured (so you know what is expected, not suspicious).** task_struct 5184->5184, tcp_sock 2432->2432, nsproxy 72->72, sock 840->840, cred 184->184, sk_buff 248->248, sched_entity 320->320, all with **0 moved offsets**; task_struct gains only the sysvsem/sysvshm unions at +164/+172 (the 32-byte pad before se at +192), tcp_sock only BBRv3's unioned bitfields. Two expected residuals: (a) \`tcp_bbr_info\`/\`tcp_cc_info\` 20->52 - UAPI inet_diag structs, enlarged by upstream's own BBRv3 so \`ss\` can report it, and no kernel module imports UAPI structs by CRC; (b) \`rate_sample\` 72->88 and \`bictcp\` - TCP-internal, and BBRv3's include/net/tcp.h hunks add members to enum tcp_ca_event / tcp_ca_ack_event_flags, which is why eight exported TCP symbols (tcp_poll, tcp_done, tcp_sendmsg_locked, tcp_read_sock, tcp_recv_skb, tcp_read_done, tcp_sock_set_cork, tcp_sock_set_nodelay) changed CRC. Verified offline: **no module on this device imports any of those eight** (tcp_crc_probe.py), so nothing can be refused because of them."
             echo "1. \`adb shell su -c \"dd if=/dev/block/by-name/boot_a of=/sdcard/boot_a-pre-ci.img\"\` - always have the current boot image."
             echo "2. Install **${{ env.FILE_NAME }}-AnyKernel3.zip** with KernelFlasher (or any AK3 flasher). It repacks the LIVE boot partition, keeps the header/AVB fields and refuses non-6.12 kernels."
+            if [ -n "${KSU_CI_URL:-}" ]; then
+              echo "2b. **Install the MATCHING KernelSU manager.** This run's artifacts include \\`${{ env.FILE_NAME }}-manager-spoofed.apk\\` (CI run ${KSU_CI_ID}, uapi ${KSU_CI_UAPI}) - \\`adb install -r\\` it, adding \\`-d\\` if the phone already has a newer version. Installing an OLDER manager is what broke root on 2026-10-04: a uapi $KSU_UAPI kernel will not talk to a older ksud, and \\`su\\` simply never appears. The AK3 zip installs the matching ksud to \\`/data/adb/ksud\\` at flash time when it was fetched."
+            fi
             echo "3. Reboot, then run the verification checklist in the repo README."
             if [ -f "$GITHUB_WORKSPACE/artifacts/${{ env.FILE_NAME }}-boot.img" ]; then
               echo "4. No flasher app, or the phone only reaches fastboot: \`fastboot flash boot ${{ env.FILE_NAME }}-boot.img\`. That image is header v4 with an empty cmdline and \`ramdisk_size 0\` - the stock layout, checked against the dump."

@@ -5,11 +5,14 @@
 # without root the kernel's module-refusal messages (dmesg) are unreadable - which is what blocked
 # the module diagnosis. WildKernels' AK3 ships the KSU userspace; ours only shipped the Image.
 #
-# HOW: the workflow extracts ksud from the pinned manager APK (it is embedded there as
-# lib/arm64-v8a/libksud.so, hash-verified) and puts it next to anykernel.sh. This fragment is then
-# PREPENDED to anykernel.sh, right after its shebang, so it always runs before the AK3 flow and
-# cannot be skipped by an early exit. Every command is guarded, so a read-only /data (recovery)
-# can never fail the kernel flash itself.
+# HOW: the workflow resolves the newest upstream KernelSU-Next 'Build Manager CI' run whose
+# KERNEL_SU_UAPI_VERSION equals this kernel's, downloads its manager-spoofed artifact (needs a
+# KSU_CI_TOKEN secret), lifts ksud out of it (the APK embeds it as lib/arm64-v8a/libksud.so) and
+# puts that next to anykernel.sh. This fragment is then PREPENDED to anykernel.sh, right after its
+# shebang, so it always runs before the AK3 flow and cannot be skipped by an early exit. Every
+# command is guarded, so a read-only /data (recovery) or an absent ksud can never fail the kernel
+# flash itself. Do not reinstate a hard-coded APK hash: pinning the uapi-4 release APK is what
+# installed a uapi-4 ksud under a uapi-5 kernel and cost the 2026-10-04 flash its root.
 (
   SRC=""
   for d in "$(dirname "$0")" "$AKHOME" "$PWD" "$(dirname "$0")/.."; do
