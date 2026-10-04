@@ -650,10 +650,21 @@ jobs:
           TMP="$(mktemp -d)"
           N=0
           TOTA=0; TOTD=0; TOUCHED=""
+          NSKIP=0; SKIPPED=""
           echo "heybooboo phase-1+2 feature patches from $FEAT_REPO"
           echo
-          # <sha>|<extra git-apply args>|<what it is>
-          while IFS='|' read -r SHA EXCL NOTE; do
+          # <sha>|<req|opt>|<extra git-apply args>|<what it is>
+          #
+          # TIERS, and why they exist (from run #31, which failed here in 9 minutes -
+          # exactly what this step is for):
+          #   req  a patch the feature *is*. If it does not apply, the kernel would be
+          #        wrong rather than merely less hardened, so the run stops.
+          #   opt  a hardening/upstream fix. Their tree is 6.12.93 and ours is 6.12.69, so
+          #        a hunk can sit on a line that a later stable backport rewrote - that is
+          #        what killed d39156040e (fs/binfmt_misc.c:983). Run #30 - the kernel that
+          #        boots with root and Wi-Fi - has none of these, so skipping one is safe,
+          #        while fuzzing it into place is not. Every skip is printed and summarised.
+          while IFS='|' read -r SHA TIER EXCL NOTE; do
             case "$SHA" in ''|'#'*) continue ;; esac
             P="$TMP/$SHA.patch"
             if ! curl -fsSL "https://github.com/$FEAT_REPO/commit/$SHA.patch" -o "$P"; then
@@ -662,13 +673,19 @@ jobs:
             fi
             SUBJ="$(sed -n 's/^Subject: \[PATCH\] //p' "$P" | head -1)"
             FULL="$(sed -n 's/^From \([0-9a-f]\{40\}\) .*/\1/p' "$P" | head -1)"
-            echo "--- $SHA  $SUBJ"
+            echo "--- $SHA  [$TIER]  $SUBJ"
             echo "      ($NOTE)"
             if ! git apply --check $EXCL "$P" 2>"$TMP/err"; then
-              echo "::error::$SHA does not apply cleanly to this 6.12.69 tree"
-              sed 's/^/      /' "$TMP/err" | head -30 || true
-              echo "::error::forward-port the commit by hand - do not fuzz this: a fuzzed hunk lands in the wrong function and still builds"
-              exit 1
+              if [ "$TIER" = "req" ]; then
+                echo "::error::$SHA is REQUIRED and does not apply cleanly to this 6.12.69 tree"
+                sed 's/^/      /' "$TMP/err" | head -30 || true
+                echo "::error::forward-port this one by hand - do not fuzz it: a fuzzed hunk lands in the wrong function and still builds"
+                exit 1
+              fi
+              echo "::warning::$SHA is optional and does not apply to 6.12.69 - SKIPPED, not fuzzed"
+              sed 's/^/      /' "$TMP/err" | head -12 || true
+              NSKIP=$((NSKIP+1)); SKIPPED="$SKIPPED $SHA"
+              continue
             fi
             git apply $EXCL "$P"
             for F in $(sed -n 's|^diff --git a/\([^ ]*\) b/.*|\1|p' "$P"); do
@@ -703,27 +720,31 @@ jobs:
             echo "      ok  ($FULL)"
             N=$((N+1))
           done <<'PATCHES'
-          4a540de15a||usb: typec: tcpm - register DRP for sink-clobbered dual-role ports (this is the kernel half of USB-OTG host in recovery/fastbootd; inert on a normal boot)
-          912738df5c||sched: move sysvipc fields into kABI alignment padding (the Droidspaces GKI kABI patch - REQUIRED by CONFIG_SYSVIPC in tuning.config, or later task_struct offsets move)
-          03363983e3||ipc: export init_ipc_ns and put_ipc_ns
-          6101595a18||ipc/shm: serialize orphan cleanup with shm_nattch updates
-          ba822aad8d||binfmt_misc: don't leak the user namespace when the mount fails
-          d39156040e||binfmt_misc: don't warn when the mount is completed from another user namespace
-          5f7b818fd6||binfmt_misc: don't let an 'F' entry pin its own instance
-          7551d33223||binfmt_misc: reject a flag character as the field delimiter
-          3f8a7dbc0c||binfmt_misc: set have_execfd only once the interpreter is opened
-          7bb1c30747||f2fs: shorten congestion wait to 6ms
-          08682bf70e||f2fs: shorten urgent GC sleep to 50ms
-          6fc1453e7d||f2fs: raise DEF_MIN_FSYNC_BLOCKS to 20
-          0d960a53d0||fs: lower default vfs_cache_pressure to 50
-          4d105af065||lib: inline int_sqrt with a register algorithm (from WildKernels/kernel_patches; keeps EXPORT_SYMBOL and the signature, so it is CRC-neutral)
-          cb00795956|--exclude=arch/arm64/configs/heybooboo_gki.fragment|misc: ntsync - replace the 6.10 stub with the completed driver (CONFIG_NTSYNC in tuning.config)
-          584b8b68ff||net: tcp: backport BBRv3 congestion control (13 files, +2682; the new tcp_sock fields are wrapped in a union with __kabi_ignored_0 so struct tcp_sock keeps its size and offsets)
+          912738df5c|req||sched: move sysvipc fields into kABI alignment padding (Droidspaces GKI kABI patch - CONFIG_SYSVIPC in tuning.config depends on it; without it later task_struct offsets move)
+          4a540de15a|req||usb: typec: tcpm - register DRP for sink-clobbered dual-role ports (the kernel half of USB-OTG host in recovery/fastbootd; inert on a normal boot)
+          cb00795956|req|--exclude=arch/arm64/configs/heybooboo_gki.fragment|misc: ntsync - replace the 6.10 stub with the completed driver (CONFIG_NTSYNC in tuning.config)
+          584b8b68ff|req||net: tcp: backport BBRv3 congestion control (13 files, +2682; the new tcp_sock fields sit in a union with __kabi_ignored_0 so tcp_sock keeps its size and offsets)
+          7bb1c30747|req||f2fs: shorten congestion wait to 6ms
+          08682bf70e|req||f2fs: shorten urgent GC sleep to 50ms
+          6fc1453e7d|req||f2fs: raise DEF_MIN_FSYNC_BLOCKS to 20
+          0d960a53d0|req||fs: lower default vfs_cache_pressure to 50
+          4d105af065|req||lib: inline int_sqrt with a register algorithm (WildKernels kernel_patches; keeps EXPORT_SYMBOL and the signature, so it is CRC-neutral)
+          03363983e3|opt||ipc: export init_ipc_ns and put_ipc_ns (only out-of-tree namespace users need it)
+          6101595a18|opt||ipc/shm: serialize orphan cleanup with shm_nattch updates
+          ba822aad8d|opt||binfmt_misc: don't leak the user namespace when the mount fails
+          d39156040e|opt||binfmt_misc: don't warn when the mount is completed from another user namespace (does NOT fit 6.12.69 - see run #31's log: fs/binfmt_misc.c:983)
+          5f7b818fd6|opt||binfmt_misc: don't let an 'F' entry pin its own instance
+          7551d33223|opt||binfmt_misc: reject a flag character as the field delimiter
+          3f8a7dbc0c|opt||binfmt_misc: set have_execfd only once the interpreter is opened
 
           PATCHES
           echo
           echo "applied $N heybooboo feature patches on top of 6.12.69"
-          echo "FEATURES=heybooboo-phase12" >> "$GITHUB_ENV"
+          if [ "$NSKIP" -gt 0 ]; then
+            echo "::warning::skipped $NSKIP optional patch(es) that do not fit 6.12.69:$SKIPPED"
+            echo "skipped (optional, this tree does not have their 6.12.93 context):$SKIPPED"
+          fi
+          echo "FEATURES=heybooboo-phase12 applied=$N skipped=${NSKIP}${SKIPPED}" >> "$GITHUB_ENV"
           git diff --stat | tail -3
 
       # ------------------------------------------------------------------- 7. config
