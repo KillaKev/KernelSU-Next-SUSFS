@@ -778,11 +778,16 @@ jobs:
             echo "  emptied: $pf -> $(wc -c < "$pf") bytes"
           done
 
-          echo "=== files named like protected exports / abi lists ==="
+          echo "=== files named like protected exports / abi lists (emptied where they are lists) ==="
           find "$GITHUB_WORKSPACE/kernel" -maxdepth 6 -type f \
-            \( -name '*protected_exports*' -o -name '*protected_modules*' -o -name 'abi_gki_*' \) \
-            -not -path '*/.git/*' 2>/dev/null | head -25 | while read -r pf; do
+            \( -name '*protected_exports*' -o -name '*protected_modules*' -o -name 'abi_gki_*' \
+               -o -name 'abi_symbollist*' \) -not -path '*/.git/*' 2>/dev/null | head -30 | while read -r pf; do
               echo "  $pf  ($(wc -c < "$pf") bytes)"
+              case "$pf" in
+                *protected*)
+                  : > "$pf"
+                  echo "    -> emptied (it was a protected list)" ;;
+              esac
             done || true
 
           echo "=== the code that emits the refusal (patch material if emptying is not enough) ==="
@@ -792,6 +797,22 @@ jobs:
             echo "  --- $cf ---"
             grep -n -B 8 -A 4 -F 'exports protected symbol' "$cf" || true
           done
+
+          # Persist the evidence where the ALWAYS-uploaded artifact can pick it up. GitHub truncates
+          # the step log into a stub, so findings printed only to stdout are effectively lost - that
+          # is exactly what happened with the earlier attempts. /tmp/config_smoke.log IS uploaded.
+          {
+            echo "=== pixel11 protected-exports probe ==="
+            echo "list candidates (>=3 known symbols): ${FOUND_LIST:-none}"
+            echo "code emitting the refusal: ${CODEF:-none}"
+            echo "--- protected/abi files present after the edits ---"
+            find "$GITHUB_WORKSPACE/kernel" -maxdepth 6 -type f \
+              \( -name '*protected*' -o -name 'abi_gki_*' -o -name 'abi_symbollist*' \) \
+              -not -path '*/.git/*' -exec ls -la {} \; 2>/dev/null || true
+            echo "--- code context ---"
+            for cf in $CODEF; do echo "### $cf"; grep -n -B 8 -A 4 -F 'exports protected symbol' "$cf" || true; done
+          } >> /tmp/config_smoke.log 2>&1 || true
+          echo "probe written to /tmp/config_smoke.log ($(wc -c < /tmp/config_smoke.log 2>/dev/null || echo 0) bytes)"
 
           echo "--- KSU/SUSFS lines now in gki_defconfig ---"
           grep -nE '^CONFIG_KSU|^# CONFIG_KSU' "$DEFCONFIG" || echo "(none)"
