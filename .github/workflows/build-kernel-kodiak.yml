@@ -856,7 +856,10 @@ jobs:
       # update_entity_lag() but no entity_lag() at all - it arrived upstream between .69 and
       # .93 - and guessing at scheduler internals is worse than dropping a tuning detail.
       - name: "Features - phase 3: apply the rebased BORE patch"
-        if: ${{ inputs.features == 'phase3' }}
+        # Cumulative, not exclusive: features=phase4 means "everything", so a phase-4 build still
+        # carries BORE. That is what lets one dispatch end with the whole feature set instead of
+        # trading phase 4 for phase 3 (run #43 was built without BORE for exactly that reason).
+        if: ${{ inputs.features == 'phase3' || inputs.features == 'phase4' }}
         run: |
           set -o pipefail
           cd "$GITHUB_WORKSPACE/kernel/common"
@@ -1114,7 +1117,10 @@ jobs:
           # without BORE, which is why this is its own file rather than a line in
           # tuning.config.
           # ---------------------------------------------------------------------------
-          if [ "${{ inputs.features }}" = "phase3" ]; then
+          # phase3 OR phase4: phase 4 is a superset (see the BORE step), so its build needs
+          # CONFIG_SCHED_BORE too - otherwise the BORE code is compiled in but its config, which is
+          # what the sysctl /proc/sys/kernel/sched_bore depends on, silently would not be.
+          if [ "${{ inputs.features }}" = "phase3" ] || [ "${{ inputs.features }}" = "phase4" ]; then
             echo "--- applying .github/scripts/kodiak/bore.config (phase 3) ---"
             while IFS= read -r line || [ -n "$line" ]; do
               apply_line "$line" || { echo "::error::could not apply bore line: [$line]"; exit 1; }
