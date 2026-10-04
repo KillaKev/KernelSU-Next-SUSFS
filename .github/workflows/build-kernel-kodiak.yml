@@ -944,8 +944,8 @@ jobs:
           security/baseband-guard/Makefile security/baseband-guard/tracing/tracing.c; do
           test -f "$f" || { echo "::error::$f is missing after the phase-4 patches"; exit 1; }
           done
-          n="$(grep -c 'baseband_guard' include/linux/lsm_count.h || true)"
-          [ "$n" -ge 1 ] || { echo "::error::baseband_guard did not reserve its LSM slot"; exit 1; }
+          n="$(grep -c 'BBG_ENABLED' include/linux/lsm_count.h || true)"
+          [ "$n" -ge 1 ] || { echo "::error::BBG_ENABLED is missing from lsm_count.h - the LSM slot was not reserved"; exit 1; }
           n="$(grep -c 'source "security/baseband-guard/Kconfig"' security/Kconfig || true)"
           [ "$n" = "1" ] || { echo "::error::security/Kconfig wiring is wrong (found $n)"; exit 1; }
           n="$(grep -c 'obj-$(CONFIG_BBG) += baseband-guard/' security/Makefile || true)"
