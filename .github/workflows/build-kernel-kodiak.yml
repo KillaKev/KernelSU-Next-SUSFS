@@ -119,6 +119,14 @@ on:
         description: 'Optional: mkbootimg --os_patch_level. LEAVE EMPTY for the same reason (stock boot.img has patch level 0; stock init_boot has 2026-09).'
         required: false
         default: ''
+      features:
+        description: 'Extra, non-KernelSU/SUSFS feature set ported from asdfmonster261/heybooboo-kernel. heybooboo-phase12 = container namespaces/SysV IPC + binfmt_misc fixes + ntsync + BBRv3 + f2fs/vfs/int_sqrt tuning + tcpm DRP (recovery USB-OTG host). none = the bare KSU/SUSFS kernel, i.e. exactly run #30. Later phases (BORE, Baseband-guard, arm64 memcpy) are separate commits, not inputs.'
+        required: false
+        default: 'heybooboo-phase12'
+        type: choice
+        options:
+          - none
+          - heybooboo-phase12
 
 jobs:
   build:
@@ -607,6 +615,117 @@ jobs:
             echo "OK   every SUSFS call in KernelSU-Next resolves to the installed SUSFS or to the fork itself"
           fi
 
+      # ------------------------------------------------ 6b. heybooboo feature patches
+      # PHASE 1 + 2 of the port from asdfmonster261/heybooboo-kernel (branch ksunext-susfs).
+      # That is a 6.12.93 tree; ours is pinned to 6.12.69 because that is the sublevel the
+      # phone boots and therefore the only CRC-safe choice. So nothing is merged wholesale:
+      # every feature is one single-purpose upstream-authored commit, fetched as a .patch
+      # from its own commit page and applied with `git apply` (STRICT). Strict is the point:
+      # `git apply` tolerates a moved line offset - which is exactly what happens when a
+      # stable backport landed between 6.12.69 and 6.12.93 - but refuses altered context. A
+      # refusal here costs seconds; the alternative is a kernel that builds fine and is
+      # subtly wrong on the phone.
+      #
+      # Per-patch post-conditions (a patch that "applied" without adding its lines is the one
+      # failure mode that would otherwise reach a 2-hour build):
+      #   1. every file named in the patch shows up as modified in `git status --porcelain`
+      #   2. the tree's added/removed line counts equal the patch's own counts
+      #
+      # Deliberately NOT in this list:
+      #   * their config-only commits (a9521c6909, 62c41a0d4f, 009f068a60, 6c23f6ca52,
+      #     dc5d5e9139, 28668bd401, db90629524, b3fc9b5585, 3436321b0a) - all nine edit
+      #     arch/arm64/configs/heybooboo_gki.fragment, which does not exist in this tree.
+      #     Their content is reproduced verbatim in tuning.config, applied two steps below.
+      #   * BORE + PELT x2 + uclamp top-app floor (25578b5b60, 42e178e8e2, d5aa49dd96,
+      #     fef16147fc, 27cee96dab, 6c1f29dd0d) - phase 3: the scheduler, gets its own boot test.
+      #   * Baseband-guard LSM (ea4b5ea437, 7b9693fbdb, 23baed360e) - phase 4.
+      #   * arm64 memcmp/memcpy (4754a780f7, c252209f56) - phase 4: boot-critical code for a
+      #     small win, not worth the risk next to BBRv3.
+      - name: Features - apply the heybooboo feature patches (phase 1+2)
+        if: ${{ inputs.features == 'heybooboo-phase12' }}
+        run: |
+          set -o pipefail
+          cd "$GITHUB_WORKSPACE/kernel/common"
+          FEAT_REPO="asdfmonster261/heybooboo-kernel"
+          TMP="$(mktemp -d)"
+          N=0
+          TOTA=0; TOTD=0; TOUCHED=""
+          echo "heybooboo phase-1+2 feature patches from $FEAT_REPO"
+          echo
+          # <sha>|<extra git-apply args>|<what it is>
+          while IFS='|' read -r SHA EXCL NOTE; do
+            case "$SHA" in ''|'#'*) continue ;; esac
+            P="$TMP/$SHA.patch"
+            if ! curl -fsSL "https://github.com/$FEAT_REPO/commit/$SHA.patch" -o "$P"; then
+              echo "::error::cannot download $FEAT_REPO commit $SHA"
+              exit 1
+            fi
+            SUBJ="$(sed -n 's/^Subject: \[PATCH\] //p' "$P" | head -1)"
+            FULL="$(sed -n 's/^From \([0-9a-f]\{40\}\) .*/\1/p' "$P" | head -1)"
+            echo "--- $SHA  $SUBJ"
+            echo "      ($NOTE)"
+            if ! git apply --check $EXCL "$P" 2>"$TMP/err"; then
+              echo "::error::$SHA does not apply cleanly to this 6.12.69 tree"
+              sed 's/^/      /' "$TMP/err" | head -30 || true
+              echo "::error::forward-port the commit by hand - do not fuzz this: a fuzzed hunk lands in the wrong function and still builds"
+              exit 1
+            fi
+            git apply $EXCL "$P"
+            for F in $(sed -n 's|^diff --git a/\([^ ]*\) b/.*|\1|p' "$P"); do
+              case "$EXCL" in *"$F"*) echo "      (excluded by --exclude: $F)"; continue ;; esac
+              if [ -z "$(git status --porcelain -- "$F")" ]; then
+                echo "::error::$SHA: $F is not modified - the patch did not do what it claims"
+                exit 1
+              fi
+              TOUCHED="$TOUCHED $F"
+            done
+            # Line counts, cumulative, and only inside hunks. Both details were earned by
+            # validating this step offline against all 16 patches before running it:
+            #   * outside hunks a commit message with "- " bullets reads as deletions
+            #     (binfmt_misc ba822aad8d and 3f8a7dbc0c each lose 2)
+            #   * a bare "+" line is a real added line that git counts, so match git's
+            #     counting, not grep's; and accumulate, because this diff is against HEAD
+            #     (the loop applies 16 patches, not one)
+            # -- TOUCHED also keeps unrelated dirty files (the SUSFS tree copy and the
+            # KernelSU-Next install, which are new files under different paths) out of the
+            # count. None of the 16 patches touches a file either of those steps writes.
+            PA="$(awk '/^diff --git/{h=0} /^@@ /{h=1;next} h&&/^\+/{a++} END{print a+0}' "$P")"
+            PD="$(awk '/^diff --git/{h=0} /^@@ /{h=1;next} h&&/^-/{d++} END{print d+0}' "$P")"
+            TOTA=$((TOTA + PA)); TOTD=$((TOTD + PD))
+            git add -A -- $TOUCHED
+            GOTA="$(git diff --cached --numstat -- $TOUCHED | awk '{a+=$1} END{print a+0}')"
+            GOTD="$(git diff --cached --numstat -- $TOUCHED | awk '{d+=$2} END{print d+0}')"
+            echo "      lines: this patch +$PA/-$PD   cumulative +$TOTA/-$TOTD   tree now +$GOTA/-$GOTD"
+            if [ "$GOTA" != "$TOTA" ] || [ "$GOTD" != "$TOTD" ]; then
+              echo "::error::$SHA: the tree does not contain what the patches claim - +$GOTA/-$GOTD present vs +$TOTA/-$TOTD expected"
+              exit 1
+            fi
+            echo "      ok  ($FULL)"
+            N=$((N+1))
+          done <<'PATCHES'
+          4a540de15a||usb: typec: tcpm - register DRP for sink-clobbered dual-role ports (this is the kernel half of USB-OTG host in recovery/fastbootd; inert on a normal boot)
+          912738df5c||sched: move sysvipc fields into kABI alignment padding (the Droidspaces GKI kABI patch - REQUIRED by CONFIG_SYSVIPC in tuning.config, or later task_struct offsets move)
+          03363983e3||ipc: export init_ipc_ns and put_ipc_ns
+          6101595a18||ipc/shm: serialize orphan cleanup with shm_nattch updates
+          ba822aad8d||binfmt_misc: don't leak the user namespace when the mount fails
+          d39156040e||binfmt_misc: don't warn when the mount is completed from another user namespace
+          5f7b818fd6||binfmt_misc: don't let an 'F' entry pin its own instance
+          7551d33223||binfmt_misc: reject a flag character as the field delimiter
+          3f8a7dbc0c||binfmt_misc: set have_execfd only once the interpreter is opened
+          7bb1c30747||f2fs: shorten congestion wait to 6ms
+          08682bf70e||f2fs: shorten urgent GC sleep to 50ms
+          6fc1453e7d||f2fs: raise DEF_MIN_FSYNC_BLOCKS to 20
+          0d960a53d0||fs: lower default vfs_cache_pressure to 50
+          4d105af065||lib: inline int_sqrt with a register algorithm (from WildKernels/kernel_patches; keeps EXPORT_SYMBOL and the signature, so it is CRC-neutral)
+          cb00795956|--exclude=arch/arm64/configs/heybooboo_gki.fragment|misc: ntsync - replace the 6.10 stub with the completed driver (CONFIG_NTSYNC in tuning.config)
+          584b8b68ff||net: tcp: backport BBRv3 congestion control (13 files, +2682; the new tcp_sock fields are wrapped in a union with __kabi_ignored_0 so struct tcp_sock keeps its size and offsets)
+
+          PATCHES
+          echo
+          echo "applied $N heybooboo feature patches on top of 6.12.69"
+          echo "FEATURES=heybooboo-phase12" >> "$GITHUB_ENV"
+          git diff --stat | tail -3
+
       # ------------------------------------------------------------------- 7. config
       # The canonical list lives in .github/scripts/kodiak/susfs.config (same file the phone-2a
       # pipeline uses) so the options are reviewable in git rather than buried in YAML.
@@ -689,6 +808,25 @@ jobs:
           while IFS= read -r line || [ -n "$line" ]; do
             apply_line "$line" || { echo "::error::could not apply module-compat line: [$line]"; exit 1; }
           done < "$GITHUB_WORKSPACE/.github/scripts/kodiak/module-compat.config"
+
+          # ---------------------------------------------------------------------------
+          # FEATURE TUNING - phase 1+2 of the heybooboo port: container namespaces and
+          # SysV IPC, ntsync, BBRv3, qdiscs, netfilter/ipset. This file mirrors their
+          # arch/arm64/configs/heybooboo_gki.fragment; the *code* half of each feature is
+          # applied by the step above, and that order matters: kconfig silently drops a
+          # line whose symbol does not exist, so CONFIG_NTSYNC and CONFIG_TCP_CONG_BBR3
+          # are inert until their Kconfig entries arrive with the patches.
+          #
+          # features=none is the control: the kernel of run #30, nothing else.
+          # ---------------------------------------------------------------------------
+          if [ "${{ inputs.features }}" = "none" ]; then
+            echo "--- FEATURE CONTROL: features=none, tuning.config NOT applied (this is run #30) ---"
+          else
+            echo "--- applying .github/scripts/kodiak/tuning.config (features=${{ inputs.features }}) ---"
+            while IFS= read -r line || [ -n "$line" ]; do
+              apply_line "$line" || { echo "::error::could not apply tuning line: [$line]"; exit 1; }
+            done < "$GITHUB_WORKSPACE/.github/scripts/kodiak/tuning.config"
+          fi
           grep -nE '^CONFIG_MODULE_(ALLOW_BTF_MISMATCH|SCMVERSION)|^# CONFIG_MODULE_SIG_PROTECT is not set' "$DEFCONFIG" || true
           # Report rather than fail: if this ACK tree has no such symbol the line is inert, and
           # that must be visible instead of silent.
@@ -1433,6 +1571,39 @@ jobs:
           fi
           ls -la "$GITHUB_WORKSPACE/artifacts"
 
+      # --------------------------------------------- 11b. struct-layout gate input
+      # The struct-layout gate needs BTF from *this* build. vmlinux is ~500 MB and .BTF
+      # is not SHF_ALLOC, so it never reaches Image/Image.lz4 - hence objcopy-ing just
+      # that section here: a few MB, uploads fine, and it is the only thing that can
+      # answer the question a CRC check cannot, namely "did a struct member move?".
+      # The gate itself runs locally, before flashing:
+      #   python btf_structs.py diff _kernel_ref/btf_baseline_run30.vmlinux <name>-BTF
+      - name: Extract the .BTF section (struct-layout gate input)
+        run: |
+          set -o pipefail
+          cd "$GITHUB_WORKSPACE/kernel"
+          VM="bazel-bin/common/kernel_aarch64/vmlinux"
+          if [ ! -f "$VM" ]; then
+            echo "::error::$VM not found - the struct-layout gate cannot run without it"
+            find bazel-bin -maxdepth 4 -name 'vmlinux*' 2>/dev/null | head -10 || true
+            exit 1
+          fi
+          OC="$(command -v llvm-objcopy || command -v objcopy || true)"
+          if [ -z "$OC" ]; then
+            echo "::error::neither llvm-objcopy nor objcopy is on this runner"
+            exit 1
+          fi
+          ls -la "$VM"
+          "$OC" -O binary --only-section=.BTF "$VM" "$GITHUB_WORKSPACE/artifacts/${FILE_NAME}-BTF"
+          ls -la "$GITHUB_WORKSPACE/artifacts/${FILE_NAME}-BTF"
+          # A BTF blob starts with the magic 0xEB9F, little-endian: 9f eb
+          MAGIC="$(od -An -tx1 -N2 "$GITHUB_WORKSPACE/artifacts/${FILE_NAME}-BTF" | tr -d ' \n')"
+          if [ "$MAGIC" != "9feb" ]; then
+            echo "::error::${FILE_NAME}-BTF does not start with the BTF magic (got '$MAGIC')"
+            exit 1
+          fi
+          echo "BTF magic OK - feed this file to: python btf_structs.py diff <baseline> <this file>"
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -1455,6 +1626,7 @@ jobs:
             echo "| | |"
             echo "|---|---|"
             echo "| Device | Pixel 11 Pro XL (**kodiak**, Tensor G6) |"
+            echo "| Features | \\`${{ inputs.features }}\\` (heybooboo port phase 1+2 = container namespaces/SysV IPC, binfmt fixes, ntsync, BBRv3, f2fs/vfs/int_sqrt, tcpm DRP \\`none\\` = run #30) |"
             echo "| ACK branch | \`${{ inputs.kernel_branch }}\` |"
             echo "| KMI | android16-6.12 (sublevel ${{ inputs.expected_sublevel }}) |"
             echo "| Device patch level | ${{ inputs.os_patch_level }} |"
@@ -1467,6 +1639,7 @@ jobs:
             echo
             echo "### Flashing (keep the phone rooted and backed up)"
             echo "0. **BENCH GATE FIRST - this is the step that failed on 2026-10-03.** \`python crc_gate.py --symvers ${FILE_NAME}-Module.symvers --modules <pulled device module dir>\`: every module imported by the phone must find its EXACT symbol CRC in our Module.symvers. If it cannot, that module will be refused at load and take its subsystem down (Wi-Fi = cfg80211 + bcmdhd4383/4390). Do not flash on a red gate."
+            echo "0b. **STRUCT-LAYOUT GATE - new with features=heybooboo-phase12.** The feature set adds fields to struct task_struct (CONFIG_SYSVIPC, relocated into the kABI padding by patch 912738df5c) and to struct tcp_sock (BBRv3, wrapped in a union with __kabi_ignored_0). Both are *designed* to leave offsets alone, and a CRC check cannot see a moved field offset - it only sees declaration changes. So diff this run's vmlinux against the run #30 baseline: \`python btf_structs.py diff _kernel_ref/btf_baseline_run30.vmlinux <this run's vmlinux>\`. A moved offset in a struct a vendor module touches is a no-flash, and the fix is to drop that one config (CONFIG_SYSVIPC/IPC_NS) rather than to hope."
             echo "1. \`adb shell su -c \"dd if=/dev/block/by-name/boot_a of=/sdcard/boot_a-pre-ci.img\"\` - always have the current boot image."
             echo "2. Install **${{ env.FILE_NAME }}-AnyKernel3.zip** with KernelFlasher (or any AK3 flasher). It repacks the LIVE boot partition, keeps the header/AVB fields and refuses non-6.12 kernels."
             echo "3. Reboot, then run the verification checklist in the repo README."
