@@ -127,6 +127,7 @@ on:
         options:
           - none
           - heybooboo-phase12
+          - phase3
 
 jobs:
   build:
@@ -642,7 +643,7 @@ jobs:
       #   * arm64 memcmp/memcpy (4754a780f7, c252209f56) - phase 4: boot-critical code for a
       #     small win, not worth the risk next to BBRv3.
       - name: Features - apply the heybooboo feature patches (phase 1+2)
-        if: ${{ inputs.features == 'heybooboo-phase12' }}
+        if: ${{ inputs.features != 'none' }}
         run: |
           set -o pipefail
           cd "$GITHUB_WORKSPACE/kernel/common"
@@ -769,7 +770,7 @@ jobs:
       # The patterns are deliberately tab-free: a literal tab in YAML is a hazard, and \1/\2
       # are followed by letters so they cannot be misread as backreference 16.
       - name: Features - hand-port the f2fs congestion fixup that 6.12.69 moved
-        if: ${{ inputs.features == 'heybooboo-phase12' }}
+        if: ${{ inputs.features != 'none' }}
         run: |
           set -o pipefail
           cd "$GITHUB_WORKSPACE/kernel/common"
@@ -799,6 +800,58 @@ jobs:
             exit 1
           fi
           echo "ok: f2fs DEFAULT_IO_TIMEOUT 20ms -> 6ms, tabs intact (hand-port of 7bb1c30747)"
+
+      # ------------------------------------------------------- 6d. phase 3: BORE
+      # BORE (Burst-Oriented Response Enhancer) plus the PELT 2x multiplier, the uclamp
+      # top-app floor and the hard-lock fix that goes with it. Their six commits do NOT
+      # apply one at a time to a 6.12.69 GKI tree: the include blocks and one struct member
+      # moved between .69 and .93. Four of them do apply, and two reject 5 hunks between
+      # them, so the whole phase was rebased into one patch by _kernel_ref/build_phase3.py -
+      # which places the rejected hunks with exact-context assertions and then proves the
+      # result applies to a clean tree. The patch lives in the repo, so the CI fetches
+      # nothing that can drift.
+      #
+      # BORE keeps its 32-byte per-task state in the four ANDROID_KABI_RESERVE slots
+      # (ANDROID_KABI_USE(4..7, u64)) instead of a union - their comment notes a union would
+      # "fold to one placeholder in gendwarfksyms and shift task_struct's version hash" - so
+      # task_struct neither grows nor moves. The struct-layout gate is what proves that.
+      #
+      # Deliberately absent, and recorded here so nobody hunts for it: BORE's fair.c tweak
+      # inside entity_lag() ("limit >>= 1" under sched_bore_key). 6.12.69 fair.c has
+      # update_entity_lag() but no entity_lag() at all - it arrived upstream between .69 and
+      # .93 - and guessing at scheduler internals is worse than dropping a tuning detail.
+      - name: "Features - phase 3: apply the rebased BORE patch"
+        if: ${{ inputs.features == 'phase3' }}
+        run: |
+          set -o pipefail
+          cd "$GITHUB_WORKSPACE/kernel/common"
+          P="$GITHUB_WORKSPACE/.github/scripts/kodiak/patches/phase3-bore.patch"
+          test -f "$P" || { echo "::error::$P is missing - was it published?"; exit 1; }
+          echo "applying $(basename "$P")  ($(wc -c < "$P") bytes)"
+          if ! git apply --check "$P"; then
+            echo "::error::phase3-bore.patch does not apply to this tree"
+            git apply --check -v "$P" 2>&1 | head -20 || true
+            exit 1
+          fi
+          git apply "$P"
+          # Post-conditions: the two files BORE adds, and the KABI slot edit that keeps it
+          # offset-neutral. Without the latter the scheduler would still work and the KMI
+          # would be silently wrong.
+          for f in kernel/sched/bore.c include/linux/sched/bore.h; do
+            test -f "$f" || { echo "::error::$f was not created by the patch"; exit 1; }
+          done
+          n="$(grep -c 'ANDROID_KABI_USE(4, u64 __bore_q0)' include/linux/sched.h || true)"
+          if [ "$n" != "1" ]; then
+            echo "::error::BORE's KABI slot edit is missing from include/linux/sched.h (found $n)"
+            exit 1
+          fi
+          n="$(grep -c 'update_curr_bore(task_of(curr), delta_exec)' kernel/sched/fair.c || true)"
+          if [ "$n" != "1" ]; then
+            echo "::error::BORE's update_curr hook is missing from kernel/sched/fair.c (found $n)"
+            exit 1
+          fi
+          echo "ok: BORE in place (kernel/sched/bore.c, include/linux/sched/bore.h, KABI slots 4-7)"
+          git diff --stat | tail -3
 
       # ------------------------------------------------------------------- 7. config
       # The canonical list lives in .github/scripts/kodiak/susfs.config (same file the phone-2a
@@ -900,6 +953,21 @@ jobs:
             while IFS= read -r line || [ -n "$line" ]; do
               apply_line "$line" || { echo "::error::could not apply tuning line: [$line]"; exit 1; }
             done < "$GITHUB_WORKSPACE/.github/scripts/kodiak/tuning.config"
+          fi
+
+          # ---------------------------------------------------------------------------
+          # PHASE 3 (BORE): one extra symbol, and it only exists because the previous step
+          # applied the rebased BORE patch - which added it to init/Kconfig. Without that
+          # patch kconfig drops the line with a warning and the kernel is simply built
+          # without BORE, which is why this is its own file rather than a line in
+          # tuning.config.
+          # ---------------------------------------------------------------------------
+          if [ "${{ inputs.features }}" = "phase3" ]; then
+            echo "--- applying .github/scripts/kodiak/bore.config (phase 3) ---"
+            while IFS= read -r line || [ -n "$line" ]; do
+              apply_line "$line" || { echo "::error::could not apply bore line: [$line]"; exit 1; }
+            done < "$GITHUB_WORKSPACE/.github/scripts/kodiak/bore.config"
+            grep -n '^CONFIG_SCHED_BORE=' "$DEFCONFIG" || echo "::warning::CONFIG_SCHED_BORE did not take in the defconfig"
           fi
           grep -nE '^CONFIG_MODULE_(ALLOW_BTF_MISMATCH|SCMVERSION)|^# CONFIG_MODULE_SIG_PROTECT is not set' "$DEFCONFIG" || true
           # Report rather than fail: if this ACK tree has no such symbol the line is inert, and
@@ -1738,6 +1806,7 @@ jobs:
             echo "### Flashing (keep the phone rooted and backed up)"
             echo "0. **BENCH GATE FIRST - this is the step that failed on 2026-10-03.** \`python crc_gate.py --symvers ${FILE_NAME}-Module.symvers --modules <pulled device module dir>\`: every module imported by the phone must find its EXACT symbol CRC in our Module.symvers. If it cannot, that module will be refused at load and take its subsystem down (Wi-Fi = cfg80211 + bcmdhd4383/4390). Do not flash on a red gate."
             echo "0b. **STRUCT-LAYOUT GATE - new with features=heybooboo-phase12.** The feature set adds fields to struct task_struct (CONFIG_SYSVIPC, relocated into the kABI padding by patch 912738df5c) and to struct tcp_sock (BBRv3, wrapped in a union with __kabi_ignored_0). Both are *designed* to leave offsets alone, and a CRC check cannot see a moved field offset - it only sees declaration changes. So diff this run's vmlinux against the run #30 baseline: \`python btf_structs.py diff _kernel_ref/btf_baseline_run30.vmlinux <this run's vmlinux>\`. A moved offset in a struct a vendor module touches is a no-flash, and the fix is to drop that one config (CONFIG_SYSVIPC/IPC_NS) rather than to hope."
+            echo "0c. **What run #35 measured (so you know what is expected, not suspicious).** task_struct 5184->5184, tcp_sock 2432->2432, nsproxy 72->72, sock 840->840, cred 184->184, sk_buff 248->248, sched_entity 320->320, all with **0 moved offsets**; task_struct gains only the sysvsem/sysvshm unions at +164/+172 (the 32-byte pad before se at +192), tcp_sock only BBRv3's unioned bitfields. Two expected residuals: (a) \`tcp_bbr_info\`/\`tcp_cc_info\` 20->52 - UAPI inet_diag structs, enlarged by upstream's own BBRv3 so \`ss\` can report it, and no kernel module imports UAPI structs by CRC; (b) \`rate_sample\` 72->88 and \`bictcp\` - TCP-internal, and BBRv3's include/net/tcp.h hunks add members to enum tcp_ca_event / tcp_ca_ack_event_flags, which is why eight exported TCP symbols (tcp_poll, tcp_done, tcp_sendmsg_locked, tcp_read_sock, tcp_recv_skb, tcp_read_done, tcp_sock_set_cork, tcp_sock_set_nodelay) changed CRC. Verified offline: **no module on this device imports any of those eight** (tcp_crc_probe.py), so nothing can be refused because of them."
             echo "1. \`adb shell su -c \"dd if=/dev/block/by-name/boot_a of=/sdcard/boot_a-pre-ci.img\"\` - always have the current boot image."
             echo "2. Install **${{ env.FILE_NAME }}-AnyKernel3.zip** with KernelFlasher (or any AK3 flasher). It repacks the LIVE boot partition, keeps the header/AVB fields and refuses non-6.12 kernels."
             echo "3. Reboot, then run the verification checklist in the repo README."
