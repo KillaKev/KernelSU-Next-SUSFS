@@ -1806,6 +1806,25 @@ jobs:
             PART=${{ inputs.avb_partition_size }}
             VB_OFF=21159936   # stock vbmeta offset, read from the AVBf footer of the stock partition
             VB_LEN=6080       # stock vbmeta size
+            MB="$GITHUB_WORKSPACE/magiskboot"
+            if [ ! -x "$MB" ]; then
+              APK_URL=$(curl -fsSL https://api.github.com/repos/topjohnwu/Magisk/releases/latest | grep -o "https://[^\"]*Magisk-[^\"]*[.]apk" | head -1)
+              echo "magiskboot source: ${APK_URL:-<none>}"
+              curl -fsSL -o "$GITHUB_WORKSPACE/Magisk.apk" "$APK_URL"
+              unzip -p "$GITHUB_WORKSPACE/Magisk.apk" lib/x86_64/libmagiskboot.so > "$MB"
+              chmod +x "$MB"
+            fi
+            echo "--- magiskboot: the AnyKernel3 repack path, on the CI side ---"
+            "$MB" --help 2>&1 | head -4 || true
+            MBW="$GITHUB_WORKSPACE/mbrepack"
+            rm -rf "$MBW"; mkdir -p "$MBW"; cd "$MBW"
+            cp "$BOOT" boot.img
+            "$MB" unpack boot.img && echo "(magiskboot unpack ok)"
+            cp "$K/Image.lz4" kernel
+            "$MB" repack boot.img "$BOOT"
+            cd "$GITHUB_WORKSPACE"
+            test -s "$BOOT" || { echo "::error::magiskboot produced no image"; exit 1; }
+            echo "magiskboot image size: $(stat -c %s "$BOOT") bytes"
             MAGIC=$(dd if="$BLOB" bs=1 skip="$VB_LEN" count=4 status=none | od -An -tx1 | tr -d " \n")
             case "$MAGIC" in 41564266) echo "stock footer magic OK (AVBf)" ;; *) echo "::error::stock-footer.bin does not end with an AVBf footer (got $MAGIC)" ; exit 1 ;; esac
             truncate -s "$PART" "$BOOT"
