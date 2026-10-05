@@ -99,14 +99,15 @@ on:
         default: false
         type: boolean
       boot_img:
-        description: 'Also produce a boot.img for fastboot flash. none = AnyKernel3 only; avb = mkbootimg header v4 PLUS an AVB hash footer sized to the boot partition - this matches the real stock boot partition, which ends with an AVBf footer (verified on-device), and keeps the artifact self-contained; plain = the bare mkbootimg image with no footer, which only works if the target partition already holds a compatible footer.'
+        description: 'Also produce a boot.img for fastboot flash. none = AnyKernel3 only; repack (default) = mkbootimg header v4 padded to the full boot partition with the real Google-signed vbmeta + AVBf footer lifted from the stock partition, so the artifact is self-contained and needs no test key; avb = the same layout but with a freshly generated test-key footer, whose public key the bootloader rejects; plain = the bare mkbootimg image with no footer, which only works if the target partition already holds a compatible footer.'
         required: true
-        default: 'avb'
+        default: 'repack'
         type: choice
         options:
           - none
           - plain
           - avb
+          - repack
       avb_partition_size:
         description: 'boot partition size in bytes, used only for boot_img=avb. kodiak boot_a and boot_b are exactly 67108864 (64 MiB) - verified with blockdev --getsize64 on the device.'
         required: false
@@ -1793,6 +1794,27 @@ jobs:
             "${OS_ARGS[@]}" \
             --output "$BOOT"
           ls -la "$BOOT"
+
+          if [ "${{ inputs.boot_img }}" = "repack" ]; then
+            # Repack-equivalent: keep the REAL Google-signed vbmeta + AVBf footer (lifted from the
+            # genuine stock boot partition) instead of signing a fresh footer with a throwaway key.
+            # A test-key footer makes the bootloader reject the public key; the stock footer keeps the
+            # key valid and only the image hash differs - the tolerated orange state, which is exactly
+            # the layout boot_a had while the phone was booting happily.
+            BLOB="$GITHUB_WORKSPACE/.github/boot-template/kodiak/stock-footer.bin"
+            test -f "$BLOB" || { echo "::error::$BLOB missing - cannot build boot_img=repack"; exit 1; }
+            PART=${{ inputs.avb_partition_size }}
+            VB_OFF=21159936   # stock vbmeta offset, read from the AVBf footer of the stock partition
+            VB_LEN=6080       # stock vbmeta size
+            MAGIC=$(dd if="$BLOB" bs=1 skip="$VB_LEN" count=4 status=none | od -An -tx1 | tr -d " \n")
+            case "$MAGIC" in 41564266) echo "stock footer magic OK (AVBf)" ;; *) echo "::error::stock-footer.bin does not end with an AVBf footer (got $MAGIC)" ; exit 1 ;; esac
+            truncate -s "$PART" "$BOOT"
+            dd if="$BLOB" of="$BOOT" bs=1 skip=0 count="$VB_LEN" seek="$VB_OFF" conv=notrunc status=none
+            dd if="$BLOB" of="$BOOT" bs=1 skip="$VB_LEN" count=64 seek=$((PART - 64)) conv=notrunc status=none
+            echo "--- composed repack image ---"
+            ls -l "$BOOT"
+            python3 "$MK/avbtool" info_image --image "$BOOT" | head -20 || true
+          fi
 
           if [ "${{ inputs.boot_img }}" = "avb" ]; then
             openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
