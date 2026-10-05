@@ -99,9 +99,9 @@ on:
         default: false
         type: boolean
       boot_img:
-        description: 'Also produce a boot.img for fastboot flash. none = AnyKernel3 only; plain = mkbootimg header v4 (nothing else - that IS the stock layout); avb = the same image plus an AVB hash footer sized to the boot partition.'
+        description: 'Also produce a boot.img for fastboot flash. none = AnyKernel3 only; avb = mkbootimg header v4 PLUS an AVB hash footer sized to the boot partition - this matches the real stock boot partition, which ends with an AVBf footer (verified on-device), and keeps the artifact self-contained; plain = the bare mkbootimg image with no footer, which only works if the target partition already holds a compatible footer.'
         required: true
-        default: 'plain'
+        default: 'avb'
         type: choice
         options:
           - none
