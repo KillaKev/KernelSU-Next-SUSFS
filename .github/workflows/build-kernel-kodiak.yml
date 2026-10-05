@@ -1820,7 +1820,7 @@ jobs:
             rm -rf "$MBW"; mkdir -p "$MBW"; cd "$MBW"
             cp "$BOOT" boot.img
             "$MB" unpack boot.img && echo "(magiskboot unpack ok)"
-            cp "$K/Image.lz4" kernel
+            cp "$GITHUB_WORKSPACE/kernel/$K/Image.lz4" kernel
             "$MB" repack boot.img "$BOOT"
             cd "$GITHUB_WORKSPACE"
             test -s "$BOOT" || { echo "::error::magiskboot produced no image"; exit 1; }
