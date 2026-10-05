@@ -67,8 +67,22 @@ jobs:
         run: |
           set -o pipefail
           OUT="OrangeFox-${{ inputs.device }}-vendor_boot.img"
+          RAWARG=""
           if [ -n "${{ inputs.raw }}" ]; then
-            bash create.sh --device "${{ inputs.device }}" --build "${{ inputs.build }}" --raw "${{ inputs.raw }}" --out "$OUT"
+            RAWARG="${{ inputs.raw }}"
+            # The project's script takes a FILE PATH, so a URL is fetched first. Accepting a URL is
+            # what lets a NEWER raw image (their release workflow, or a fork's artifact) be used
+            # without vendoring a 64 MiB binary into this repo.
+            case "$RAWARG" in
+              http://*|https://*|file://*)
+                echo "fetching the raw image: $RAWARG"
+                curl -fsSL "$RAWARG" -o raw-unassembled.img
+                test -s raw-unassembled.img || { echo "::error::could not download the raw image"; exit 1; }
+                ls -l raw-unassembled.img
+                RAWARG="$PWD/raw-unassembled.img" ;;
+              *) echo "raw image given as a local path: $RAWARG" ;;
+            esac
+            bash create.sh --device "${{ inputs.device }}" --build "${{ inputs.build }}" --raw "$RAWARG" --out "$OUT"
           else
             bash create.sh --device "${{ inputs.device }}" --build "${{ inputs.build }}" --out "$OUT"
           fi
