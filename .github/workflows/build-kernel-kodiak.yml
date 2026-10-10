@@ -62,10 +62,6 @@ on:
           - ksun-only
           - none
 
-env:
-  # Everything heybooboo ported (phases 1-5) whenever KernelSU is built; the vanilla control gets none.
-  FEATURES: ${{ inputs.patches == 'none' && 'none' || 'phase5' }}
-
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -98,6 +94,9 @@ jobs:
           # The artifact name is exported in this, the FIRST step, so the always-run summary still
           # has a name when a later step fails and the rest are skipped (run #1's summary printed
           # "-AnyKernel3.zip" for exactly that reason). It is set before the gate below on purpose.
+          # Everything heybooboo ported (phases 1-5) whenever KernelSU is built; the vanilla control gets none.
+          if [ "${{ inputs.patches }}" = "none" ]; then FEATURES=none; else FEATURES=phase5; fi
+          echo "FEATURES=$FEATURES" >> "$GITHUB_ENV"
           echo "FILE_NAME=kodiak-${{ inputs.patches }}" >> "$GITHUB_ENV"   # provisional; the resolve step gives the real one
 
           AVAIL_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
@@ -584,7 +583,7 @@ jobs:
       #   * arm64 memcmp/memcpy (4754a780f7, c252209f56) - phase 4: boot-critical code for a
       #     small win, not worth the risk next to BBRv3.
       - name: Features - apply the heybooboo feature patches (phase 1+2)
-        if: ${{ env.FEATURES != 'none' }}
+        if: ${{ inputs.patches != 'none' }}
         run: |
           set -o pipefail
           cd "$GITHUB_WORKSPACE/kernel/common"
@@ -691,7 +690,7 @@ jobs:
             echo "::warning::skipped $NSKIP optional patch(es) that do not fit 6.12.69:$SKIPPED"
             echo "skipped (optional, this tree does not have their 6.12.93 context):$SKIPPED"
           fi
-          echo "FEATURES=heybooboo-phase12 applied=$N skipped=${NSKIP}${SKIPPED}" >> "$GITHUB_ENV"
+          echo "FEATURE_PATCHES=heybooboo-phase12 applied=$N skipped=${NSKIP}${SKIPPED}" >> "$GITHUB_ENV"
           git diff --stat | tail -3
 
       # ------------------------------ 6c. the one required patch that needs a hand-port
@@ -711,7 +710,7 @@ jobs:
       # The patterns are deliberately tab-free: a literal tab in YAML is a hazard, and \1/\2
       # are followed by letters so they cannot be misread as backreference 16.
       - name: Features - hand-port the f2fs congestion fixup that 6.12.69 moved
-        if: ${{ env.FEATURES != 'none' }}
+        if: ${{ inputs.patches != 'none' }}
         run: |
           set -o pipefail
           cd "$GITHUB_WORKSPACE/kernel/common"
@@ -769,7 +768,7 @@ jobs:
         # Cumulative, not exclusive: features=phase4 means "everything", so a phase-4 build still
         # carries BORE. That is what lets one dispatch end with the whole feature set instead of
         # trading phase 4 for phase 3 (run #43 was built without BORE for exactly that reason).
-        if: ${{ env.FEATURES == 'phase5' }}
+        if: ${{ inputs.patches != 'none' }}
         run: |
           set -o pipefail
           cd "$GITHUB_WORKSPACE/kernel/common"
@@ -832,7 +831,7 @@ jobs:
       # Their arch/arm64/configs/heybooboo_gki.fragment change is theirs alone and is excluded; its
       # content is reproduced as baseband.config by the config step.
       - name: "Features - phase 4: baseband-guard LSM"
-        if: ${{ env.FEATURES == 'phase5' }}
+        if: ${{ inputs.patches != 'none' }}
         run: |
           set -o pipefail
           cd "$GITHUB_WORKSPACE/kernel/common"
@@ -874,7 +873,7 @@ jobs:
       # as modified. An apply that "succeeded" without changing anything is the failure that would
       # otherwise only surface as a two-hour build that behaves exactly like the previous kernel.
       - name: "Features - phase 5: arm64 memcmp/memcpy"
-        if: ${{ env.FEATURES == 'phase5' }}
+        if: ${{ inputs.patches != 'none' }}
         run: |
           set -o pipefail
           cd "$GITHUB_WORKSPACE/kernel/common"
@@ -1033,10 +1032,10 @@ jobs:
           #
           # features=none is the control: the kernel of run #30, nothing else.
           # ---------------------------------------------------------------------------
-          if [ "${{ env.FEATURES }}" = "none" ]; then
+          if [ "$FEATURES" = "none" ]; then
             echo "--- FEATURE CONTROL: features=none, tuning.config NOT applied (this is run #30) ---"
           else
-            echo "--- applying .github/scripts/kodiak/tuning.config (features=${{ env.FEATURES }}) ---"
+            echo "--- applying .github/scripts/kodiak/tuning.config (features=$FEATURES) ---"
             while IFS= read -r line || [ -n "$line" ]; do
               apply_line "$line" || { echo "::error::could not apply tuning line: [$line]"; exit 1; }
             done < "$GITHUB_WORKSPACE/.github/scripts/kodiak/tuning.config"
@@ -1052,7 +1051,7 @@ jobs:
           # phase3 OR phase4: phase 4 is a superset (see the BORE step), so its build needs
           # CONFIG_SCHED_BORE too - otherwise the BORE code is compiled in but its config, which is
           # what the sysctl /proc/sys/kernel/sched_bore depends on, silently would not be.
-          if [ "${{ env.FEATURES }}" = "phase3" ] || [ "${{ env.FEATURES }}" = "phase4" ] || [ "${{ env.FEATURES }}" = "phase5" ]; then
+          if [ "$FEATURES" = "phase3" ] || [ "$FEATURES" = "phase4" ] || [ "$FEATURES" = "phase5" ]; then
             echo "--- applying .github/scripts/kodiak/bore.config (phase 3) ---"
             while IFS= read -r line || [ -n "$line" ]; do
               apply_line "$line" || { echo "::error::could not apply bore line: [$line]"; exit 1; }
@@ -1068,7 +1067,7 @@ jobs:
           # already lists instead of replacing it: the stock string also carries `integrity`, and
           # dropping it would be a silent behavioural change nothing else would notice.
           # ---------------------------------------------------------------------------
-          if [ "${{ env.FEATURES }}" = "phase4" ] || [ "${{ env.FEATURES }}" = "phase5" ]; then
+          if [ "$FEATURES" = "phase4" ] || [ "$FEATURES" = "phase5" ]; then
             echo "--- applying .github/scripts/kodiak/baseband.config (phase 4) ---"
             while IFS= read -r line || [ -n "$line" ]; do
               apply_line "$line" || { echo "::error::could not apply baseband line: [$line]"; exit 1; }
