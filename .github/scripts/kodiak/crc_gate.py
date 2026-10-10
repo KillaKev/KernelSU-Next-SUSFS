@@ -313,7 +313,14 @@ def report(res, report_path, ignored=()):
         print("\nreport written to %s" % report_path)
     except OSError as exc:
         print("\n(could not write %s: %s)" % (report_path, exc))
-    print("\nGATE: %s" % ("RED - do NOT flash this kernel" if fail else "GREEN - safe to flash"))
+    if res["unreadable"]:
+        # A module that cannot be read cannot be judged, and everything that imports its symbols then
+        # looks "not exported". That is a problem with the gate's input, not a verdict on the kernel -
+        # and it must never read as GREEN.
+        print(chr(10) + "GATE: INCONCLUSIVE - %d module file(s) could not be read (see above); this is an "
+              "extraction problem, not a verdict on the kernel" % len(res["unreadable"]))
+        return 2
+    print(chr(10) + "GATE: %s" % ("RED - do NOT flash this kernel" if fail else "GREEN - safe to flash"))
     return 1 if fail else 0
 
 

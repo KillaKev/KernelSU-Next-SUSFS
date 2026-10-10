@@ -18,7 +18,7 @@ version 1, hdr_len 24, and type/string sections that tile the blob exactly), bec
 kernel's .BTF sits in the loaded image (it is what /sys/kernel/btf/vmlinux serves).
 
 Needs: python3 + the `lz4` module (pip install lz4), and for the erofs partitions
-`fsck.erofs` (apt: erofs-utils).
+erofs support: the kernel's erofs driver via a loop mount (sudo), or `fsck.erofs` (apt: erofs-utils).
 """
 import argparse
 import gzip
@@ -104,18 +104,90 @@ def cpio_modules(cpio):
 
 
 # ------------------------------------------------------------------------------ erofs
-def extract_erofs(img, dest):
+def elf_complete(path):
+    """True if every section the ELF header describes lies inside the file (i.e. not truncated)."""
+    d = open(path, "rb").read()
+    if len(d) < 64 or d[:4] != b"\x7fELF":
+        return False
+    shoff, = struct.unpack_from("<Q", d, 0x28)
+    shentsize, shnum = struct.unpack_from("<HH", d, 0x3A)
+    if shoff + shentsize * shnum > len(d):
+        return False
+    for i in range(shnum):
+        b = shoff + i * shentsize
+        stype, = struct.unpack_from("<I", d, b + 4)
+        off, size = struct.unpack_from("<QQ", d, b + 0x18)
+        if stype != 8 and off + size > len(d):      # 8 = SHT_NOBITS (no file data)
+            return False
+    return True
+
+
+def bad_modules(dest):
+    return [os.path.join(r, f) for r, _d, fs in os.walk(dest) for f in fs
+            if f.endswith(".ko") and not elf_complete(os.path.join(r, f))]
+
+
+def count_modules(dest):
+    return sum(1 for _r, _d, fs in os.walk(dest) for f in fs if f.endswith(".ko"))
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def extract_with_mount(img, dest):
+    """Kernel EROFS driver (loop mount): the most faithful reader. Needs sudo + the erofs module."""
+    mnt = dest + ".mnt"
+    os.makedirs(mnt, exist_ok=True)
+    run(["sudo", "modprobe", "erofs"])
+    r = run(["sudo", "mount", "-t", "erofs", "-o", "ro,loop", img, mnt])
+    if r.returncode != 0:
+        print("  loop mount failed: %s" % (r.stderr.strip() or r.stdout.strip())[:200])
+        return False
+    try:
+        os.makedirs(dest, exist_ok=True)
+        r = run(["sudo", "cp", "-r", "--no-preserve=ownership", mnt + "/.", dest])
+        run(["sudo", "chown", "-R", "%d:%d" % (os.getuid(), os.getgid()), dest])
+        return r.returncode == 0
+    finally:
+        run(["sudo", "umount", mnt])
+
+
+def extract_with_fsck(img, dest):
     os.makedirs(dest, exist_ok=True)
     try:
-        r = subprocess.run(["fsck.erofs", "--extract=" + dest, img], capture_output=True, text=True)
+        r = run(["fsck.erofs", "--extract=" + dest, img])
     except FileNotFoundError:
-        die("fsck.erofs is not installed (apt: erofs-utils)")
-    n = sum(1 for _r, _d, fs in os.walk(dest) for f in fs if f.endswith(".ko"))
-    print("%s: %d modules (fsck.erofs rc=%d)" % (os.path.basename(img), n, r.returncode))
-    if n == 0:
-        print(r.stdout[-400:] + r.stderr[-400:])
-        die("no modules came out of %s" % img)
-    return n
+        print("  fsck.erofs is not installed")
+        return False
+    print("  fsck.erofs rc=%d" % r.returncode)
+    return True
+
+
+def extract_erofs(img, dest):
+    """Extract an erofs partition and prove every module came out whole.
+
+    fsck.erofs on the runner's erofs-utils was seen to drop the tail of some compressed files (9 of
+    ~280 modules came out short, which made the CRC gate fail on files that were simply incomplete), so
+    the kernel driver is tried first and the result of EVERY method is verified before it is trusted."""
+    name = os.path.basename(img)
+    for label, fn in (("kernel erofs mount", extract_with_mount), ("fsck.erofs", extract_with_fsck)):
+        shutil_rmtree(dest)
+        print("%s: trying %s" % (name, label))
+        if not fn(img, dest):
+            continue
+        n, bad = count_modules(dest), bad_modules(dest)
+        print("  %d modules, %d incomplete" % (n, len(bad)))
+        if n and not bad:
+            return n
+        for b in bad[:5]:
+            print("  incomplete: %s" % os.path.basename(b))
+    die("could not extract %s completely - every method left truncated or no modules" % name)
+
+
+def shutil_rmtree(path):
+    import shutil
+    shutil.rmtree(path, ignore_errors=True)
 
 
 # ------------------------------------------------------------------------------ BTF

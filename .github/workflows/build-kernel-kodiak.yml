@@ -1827,7 +1827,7 @@ jobs:
           python3 "$S/struct_gate.py" "$RUNNER_TEMP/gate/stock.btf" "$A/${FILE_NAME}-BTF" \
             "$A/${FILE_NAME}-struct-report.txt" || rc=1
           if [ "$rc" != "0" ]; then
-            echo "::error::a gate is RED - do not flash this kernel (see the *-report.txt files in the artifact)"
+            echo "::error::a gate did not pass - RED means do not flash; INCONCLUSIVE means the gate could not read its input (see the *-report.txt files in the artifact)"
           fi
           exit $rc
 
