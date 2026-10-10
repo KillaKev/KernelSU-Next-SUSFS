@@ -497,6 +497,18 @@ jobs:
           # No guessing and no auto-repair of rejects: a half-applied SUSFS patch produces a
           # kernel that compiles and boots but silently does nothing useful. Fail here (2 min)
           # instead of after the build + flash (3 h).
+          # The one reject we know how to resolve exactly: newer 6.12 sublevels (seen on 6.12.92)
+          # rework show_smaps_rollup(), and the two SUSFS hunks there stop matching. The hand-port is
+          # only taken when THOSE two hunks are the whole of the task_mmu.c reject.
+          if [ -f fs/proc/task_mmu.c.rej ]; then
+            NH=$(grep -c '^@@' fs/proc/task_mmu.c.rej || true)
+            if [ "$NH" = "2" ] && grep -q 'bypass_orig_flow' fs/proc/task_mmu.c.rej; then
+              echo "fs/proc/task_mmu.c.rej holds only the two show_smaps_rollup hunks - hand-porting them"
+              python3 "$GITHUB_WORKSPACE/.github/scripts/kodiak/susfs_smaps_port.py" .
+            else
+              echo "::warning::fs/proc/task_mmu.c.rej is not the known show_smaps_rollup pair ($NH hunks) - leaving it to the gate"
+            fi
+          fi
           REJS=$(find . -name '*.rej' -not -path './.git/*' | wc -l | tr -dc '0-9')
           echo ".rej files: $REJS"
           if [ "${REJS:-0}" -ne 0 ]; then
@@ -772,14 +784,22 @@ jobs:
         run: |
           set -o pipefail
           cd "$GITHUB_WORKSPACE/kernel/common"
-          P="$GITHUB_WORKSPACE/.github/scripts/kodiak/patches/phase3-bore.patch"
-          test -f "$P" || { echo "::error::$P is missing - was it published?"; exit 1; }
-          echo "applying $(basename "$P")  ($(wc -c < "$P") bytes)"
-          if ! git apply --check "$P"; then
-            echo "::error::phase3-bore.patch does not apply to this tree"
-            git apply --check -v "$P" 2>&1 | head -20 || true
+          # One rebased patch per tree shape (phase3-bore.patch = 6.12.69, phase3-bore-6.12.92.patch =
+          # 6.12.92 and the sublevels around it). The first one that applies STRICTLY is used; nothing is
+          # fuzzed. If none fits, the tree needs a new rebase (see build_phase3.py in the workspace).
+          P=""
+          for C in "$GITHUB_WORKSPACE"/.github/scripts/kodiak/patches/phase3-bore*.patch; do
+            if git apply --check "$C" 2>/dev/null; then P="$C"; break; fi
+            echo "  $(basename "$C") does not apply to this tree"
+          done
+          if [ -z "$P" ]; then
+            echo "::error::no phase3-bore*.patch applies to this tree ($KERNEL_VERSION) - BORE needs a rebase for it"
+            for C in "$GITHUB_WORKSPACE"/.github/scripts/kodiak/patches/phase3-bore*.patch; do
+              echo "---- $(basename "$C")"; git apply --check -v "$C" 2>&1 | head -12 || true
+            done
             exit 1
           fi
+          echo "applying $(basename "$P")  ($(wc -c < "$P") bytes)"
           git apply "$P"
           # Post-conditions: the two files BORE adds, and the KABI slot edit that keeps it
           # offset-neutral. Without the latter the scheduler would still work and the KMI
