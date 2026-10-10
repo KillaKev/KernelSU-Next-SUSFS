@@ -113,19 +113,17 @@ powershell -ExecutionPolicy Bypass -File C:\Users\coolk\workspace\pixel11_kernel
 
 | Input | Default | Meaning |
 |---|---|---|
-| `kernel_branch` | `common-android16-6.12-2026-03` | ACK branch in `kernel/manifest`. Must be a `common-android16-6.12-*` branch. |
-| `expected_sublevel` | `69` | Gate: the synced tree's `Makefile` `SUBLEVEL` must equal this. `69` = 2026-03 = the sublevel the phone runs. Empty string skips the gate. |
-| `ksu_repo` | `https://github.com/pershoot/KernelSU-Next.git` | KernelSU-Next fork that carries SUSFS. |
-| `ksu_branch` | `dev-susfs` | The SUSFS-carrying branch. Upstream `dev` has no SUSFS. |
-| `susfs_branch` | `gki-android16-6.12` | susfs4ksu branch on **GitLab**. Its `kernel_patches/50_add_susfs_in_gki-android16-6.12.patch` must exist (gated). |
-| `susfs_commit` | `75a61385…1a2e` | Pin, so the SUSFS side cannot drift under you. Empty = branch tip; the default is the commit the WildKernels 6.12 builds use. |
-| `os_patch_level` | `2026-09` | Device security patch level. Pins the kernel build clock and is recorded in the summary. |
-| `patches` | `ksu-susfs` | `ksu-susfs`, `ksun-only` (no SUSFS), or `none` = **VANILLA CONTROL**. |
-| `bypass_module_versions` | `false` | Also build a second `Image` with `kernel/module/version.c` `bad_version:` neutered. Last resort only. |
-| `boot_img` | `plain` | Also produce a **flashable `boot.img`** for `fastboot flash boot`. `none` = AnyKernel3 only, `plain` = mkbootimg header v4 (which *is* the stock layout), `avb` = same plus an AVB hash footer. |
-| `avb_partition_size` | `67108864` | boot partition size in bytes, used only for `boot_img=avb`. Measured on the device: boot_a and boot_b are exactly 64 MiB. |
-| `bootimg_os_version` | *(empty)* | Optional `mkbootimg --os_version`. **Leave empty.** Google's factory `boot.img` for this build has `os_version = 0`; only `init_boot.img` carries 17.0.0. |
-| `bootimg_os_patch_level` | *(empty)* | Optional `mkbootimg --os_patch_level`. Leave empty for the same reason (stock boot.img patch level is 0, stock init_boot's is 2026-09). |
+| `factory_image` | *(required)* | The **Download link** of a kodiak image on <https://developers.google.com/android/images> (`https://dl.google.com/dl/android/aosp/kodiak-<build>-factory-<hash>.zip`). The workflow reads the stock `uname -r`, the build timestamp (`uname -v`), the KMI and the security patch level out of it, and uses its `boot.img` as the base of the new one. The page builds its list with JavaScript, so a script cannot pick a build for you. |
+| `kernel` | `match` | `match` = the kernel that image ships, built from the exact commit named by the `-g<hash>` in its `uname -r`. Or another release of the **same KMI**: `2026-06`, `android16-6.12-2026-06`, `6.12.81`, `latest`, or a release tag such as `android16-6.12-2026-06_r5` (a branch means its newest tagged release). The `uname -r` is not typed in: for another release it is the one Google's certified GKI build of that release reports. The build timestamp is always the factory kernel's. |
+| `patches` | `ksu-susfs` | `ksu-susfs`, `ksun-only` (no SUSFS), or `none` = **VANILLA CONTROL**. Anything but `none` also gets the full heybooboo feature set (phases 1-5) and NoMount. |
+
+Everything else is fixed: KernelSU-Next is `pershoot/KernelSU-Next@dev-susfs`, SUSFS is the tip of the
+GitLab branch for the KMI, and the userspace is the latest matching Build Manager CI run.
+
+Output: `<name>-boot.img` is the factory `boot.img` with its kernel swapped by `magiskboot` from the
+**latest Magisk APK**, so the header, kernel compression, partition size and AVB footer are the
+factory ones (`verify_boot_img.py` checks this and that the kernel inside is byte-identical to the
+built `Image`). `<name>-AnyKernel3.zip` is still produced for KernelFlasher.
 
 Expect **~45–90 minutes** for `ksu-susfs` (kleaf `--config=fast --config=stamp`, one
 architecture, no GKI module build).
