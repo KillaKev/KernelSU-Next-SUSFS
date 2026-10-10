@@ -86,6 +86,134 @@ def download(url, dest):
     log("  -> %s (%.1f MB)" % (dest, os.path.getsize(dest) / 1e6))
 
 
+# ----------------------------------------------------------------------------- remote zip
+class RemoteFile(io.RawIOBase):
+    """Seekable read-only view of a URL, fetched with HTTP Range requests in 8 MiB blocks."""
+    BLOCK = 8 * 1024 * 1024
+
+    def __init__(self, url):
+        self.url, self.pos, self.cache = url, 0, {}
+        req = urllib.request.Request(url, headers={"Range": "bytes=0-0", "User-Agent": "kodiak-ci"})
+        with urllib.request.urlopen(req, timeout=120) as r:
+            cr = r.headers.get("Content-Range", "")
+            if r.status != 206 or "/" not in cr:
+                raise RuntimeError("server does not support range requests")
+            self.size = int(cr.rsplit("/", 1)[1])
+
+    def seekable(self):
+        return True
+
+    def readable(self):
+        return True
+
+    def tell(self):
+        return self.pos
+
+    def seek(self, off, whence=0):
+        self.pos = {0: off, 1: self.pos + off, 2: self.size + off}[whence]
+        return self.pos
+
+    def _block(self, idx):
+        if idx not in self.cache:
+            if len(self.cache) > 3:
+                self.cache.pop(next(iter(self.cache)))
+            lo = idx * self.BLOCK
+            hi = min(lo + self.BLOCK, self.size) - 1
+            self.cache[idx] = http_range(self.url, lo, hi)
+        return self.cache[idx]
+
+    def readinto(self, b):
+        n = min(len(b), self.size - self.pos)
+        if n <= 0:
+            return 0
+        got = 0
+        while got < n:
+            idx, off = divmod(self.pos, self.BLOCK)
+            chunk = self._block(idx)[off:off + n - got]
+            b[got:got + len(chunk)] = chunk
+            got += len(chunk)
+            self.pos += len(chunk)
+        return got
+
+
+def http_range(url, lo, hi, tries=4):
+    last = None
+    for _ in range(tries):
+        try:
+            req = urllib.request.Request(url, headers={"Range": "bytes=%d-%d" % (lo, hi), "User-Agent": "kodiak-ci"})
+            with urllib.request.urlopen(req, timeout=300) as r:
+                data = r.read()
+            if len(data) == hi - lo + 1:
+                return data
+        except Exception as e:  # transient network trouble
+            last = e
+    raise RuntimeError("range %d-%d of %s failed: %s" % (lo, hi, url, last))
+
+
+class SubFile(io.RawIOBase):
+    """A [off, off+size) window of another seekable file (a STORED zip member read in place)."""
+
+    def __init__(self, f, off, size):
+        self.f, self.off, self.size, self.pos = f, off, size, 0
+
+    def seekable(self):
+        return True
+
+    def readable(self):
+        return True
+
+    def tell(self):
+        return self.pos
+
+    def seek(self, p, whence=0):
+        self.pos = {0: p, 1: self.pos + p, 2: self.size + p}[whence]
+        return self.pos
+
+    def readinto(self, b):
+        n = min(len(b), self.size - self.pos)
+        if n <= 0:
+            return 0
+        self.f.seek(self.off + self.pos)
+        d = self.f.read(n)
+        b[:len(d)] = d
+        self.pos += len(d)
+        return len(d)
+
+
+def open_inner_zip(url, work):
+    """The image-kodiak-*.zip inside the factory zip, as a ZipFile.
+
+    The factory zip is ~15 GB, but only a few hundred MB of it is ever needed, and the inner zip is
+    STORED (not compressed). So it is read in place over HTTP Range requests. If the server or the
+    layout does not allow that, fall back to downloading the whole thing."""
+    try:
+        outer = zipfile.ZipFile(RemoteFile(url))
+        info = next(i for i in outer.infolist() if re.match(r"^.*image-kodiak-.*\.zip$", i.filename))
+        if info.compress_type != 0:
+            raise RuntimeError("inner zip is compressed")
+        rf = outer.fp
+        rf.seek(info.header_offset)
+        hdr = rf.read(30)
+        n, m = struct.unpack("<HH", hdr[26:30])
+        inner = zipfile.ZipFile(SubFile(rf, info.header_offset + 30 + n + m, info.file_size))
+        log("reading the factory image in place over HTTP ranges (%.1f GB zip, only the needed images are fetched)"
+            % (rf.size / 1e9))
+        return inner
+    except Exception as e:
+        log("range reading not possible (%s) - downloading the whole factory zip" % e)
+    zpath = os.path.join(work, "factory.zip")
+    download(url, zpath)
+    with zipfile.ZipFile(zpath) as outer:
+        name = next((n for n in outer.namelist() if re.match(r"^.*image-kodiak-.*\.zip$", n)), None)
+        if not name:
+            die("no image-kodiak-*.zip inside the factory zip: " + ", ".join(outer.namelist()[:20]))
+        inner_path = os.path.join(work, "inner.zip")
+        with outer.open(name) as src, open(inner_path, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+    os.remove(zpath)
+    return zipfile.ZipFile(inner_path)
+
+
 # ----------------------------------------------------------------------------- magiskboot
 def fetch_magiskboot(dest, token):
     """The magiskboot that ships inside the LATEST Magisk APK (x86_64 build, runs on the runner)."""
@@ -231,28 +359,28 @@ def main():
     mb_ver = fetch_magiskboot(args.magiskboot, token)
     out["MAGISK_VERSION"] = mb_ver
 
-    zpath = os.path.join(args.work, "factory.zip")
-    download(url, zpath)
-    with zipfile.ZipFile(zpath) as outer:
-        inner_name = next((n for n in outer.namelist() if re.match(r"^.*image-kodiak-.*\.zip$", n)), None)
-        if not inner_name:
-            die("no image-kodiak-*.zip inside the factory zip: " + ", ".join(outer.namelist()[:20]))
-        inner_path = os.path.join(args.work, "inner.zip")
-        with outer.open(inner_name) as src, open(inner_path, "wb") as dst:
-            shutil.copyfileobj(src, dst)
-    os.remove(zpath)
-    with zipfile.ZipFile(inner_path) as inner:
-        boot = os.path.join(args.work, "boot.img")
-        with inner.open("boot.img") as src, open(boot, "wb") as dst:
-            shutil.copyfileobj(src, dst)
-        init_hdr = inner.open("init_boot.img").read(4096) if "init_boot.img" in inner.namelist() else b""
-    os.remove(inner_path)
-    os.makedirs(os.path.dirname(args.stock_out), exist_ok=True)
+    stock_dir = os.path.dirname(args.stock_out)
+    os.makedirs(stock_dir, exist_ok=True)
+    inner = open_inner_zip(url, args.work)
+    names = set(inner.namelist())
+    boot = os.path.join(args.work, "boot.img")
+    with inner.open("boot.img") as src, open(boot, "wb") as dst:
+        shutil.copyfileobj(src, dst)
+    init_hdr = inner.open("init_boot.img").read(4096) if "init_boot.img" in names else b""
+    # the partitions the automatic gates (CRC / struct layout) read their stock side from
+    for part in ("vendor_kernel_boot", "vendor_boot", "vendor_dlkm", "system_dlkm"):
+        if part + ".img" in names:
+            with inner.open(part + ".img") as src, open(os.path.join(stock_dir, part + ".img"), "wb") as dst:
+                shutil.copyfileobj(src, dst)
+            log("kept %s.img (%d bytes)" % (part, os.path.getsize(os.path.join(stock_dir, part + ".img"))))
+    inner.close()
     shutil.copy(boot, args.stock_out)
     log("stock boot.img kept at %s (%d bytes)" % (args.stock_out, os.path.getsize(args.stock_out)))
 
     # ---- 2. what the stock kernel says about itself ---------------------------------------
     kern = kernel_from_boot(args.magiskboot, boot, os.path.join(args.work, "stock-unpacked"))
+    with open(os.path.join(stock_dir, "Image"), "wb") as f:
+        f.write(kern)
     banner, stock_release, stock_ts = parse_banner(kern)
     log("stock banner : " + banner)
     sm = RELEASE_RE.match(stock_release)

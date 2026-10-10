@@ -1800,6 +1800,37 @@ jobs:
           fi
           echo "BTF magic OK - feed this file to: python btf_structs.py diff <baseline> <this file>"
 
+      # --------------------------------------------- 11c. automatic gates (nothing to run by hand)
+      # Both checks need the STOCK side, which comes out of the factory image the resolve step already
+      # read: the modules the phone loads (vendor_kernel_boot ramdisk + vendor_dlkm + system_dlkm,
+      # ~400 .ko files - the running filesystem only shows about half of them) and the stock kernel's
+      # BTF. A red gate fails the job, but the artifacts are still uploaded (so nothing is lost).
+      #   crc_gate.py     every module's expected symbol CRCs against this kernel's Module.symvers
+      #                   (the check that would have caught the 2026-10-03 dead-Wi-Fi flash).
+      #                   rust_binder is excluded: its Rust symbol names carry a crate hash, so it can
+      #                   never load on a non-Google build, and the phone uses the built-in binder.
+      #   struct_gate.py  no struct that vendor modules access moved a member or changed size - the
+      #                   one thing a CRC cannot see.
+      - name: Gates - vendor module CRCs + struct layout (automatic)
+        run: |
+          set -o pipefail
+          S="$GITHUB_WORKSPACE/.github/scripts/kodiak"
+          A="$GITHUB_WORKSPACE/artifacts"
+          sudo apt-get -qq update
+          sudo apt-get -qq install -y erofs-utils python3-lz4
+          python3 "$S/extract_stock.py" --stock "$GITHUB_WORKSPACE/stock" --out "$RUNNER_TEMP/gate"
+          test -f "$A/${FILE_NAME}-Module.symvers" || { echo "::error::no Module.symvers was produced - the CRC gate cannot run"; exit 1; }
+          rc=0
+          python3 "$S/crc_gate.py" --symvers "$A/${FILE_NAME}-Module.symvers" \
+            --modules "$RUNNER_TEMP/gate/modules" --ignore-module rust_binder \
+            --report "$A/${FILE_NAME}-crc-report.txt" || rc=1
+          python3 "$S/struct_gate.py" "$RUNNER_TEMP/gate/stock.btf" "$A/${FILE_NAME}-BTF" \
+            "$A/${FILE_NAME}-struct-report.txt" || rc=1
+          if [ "$rc" != "0" ]; then
+            echo "::error::a gate is RED - do not flash this kernel (see the *-report.txt files in the artifact)"
+          fi
+          exit $rc
+
       - name: Upload artifacts
         # RUN #34 LESSON: this had no `always()`, so when the .BTF step failed the whole
         # build (Image, Image.lz4, boot.img and the AnyKernel3 zip - 28 minutes of it) was
@@ -1837,6 +1868,16 @@ jobs:
             echo "| Userspace | KernelSU-Next uapi ${KSU_UAPI:-n/a}; latest Build Manager CI ${KSU_CI_SHA:-not resolved} (uapi ${KSU_CI_UAPI:-?}), run ${KSU_CI_ID:-n/a} |"
             echo "| boot.img made with | magiskboot from Magisk ${MAGISK_VERSION:-?} |"
             echo
+            echo "### Automatic gates"
+            for g in crc struct; do
+              R="$GITHUB_WORKSPACE/artifacts/${FILE_NAME}-$g-report.txt"
+              if [ -f "$R" ]; then
+                echo "- $g: $(grep -m1 '^GATE:' "$R")"
+              else
+                echo "- $g: did not run (an earlier step failed)"
+              fi
+            done
+            echo
             echo "### Flashing (keep the phone backed up)"
             if [ -n "$BOOT" ]; then
               echo "- fastboot: fastboot flash boot ${FILE_NAME}-boot.img   (same size, header and AVB footer as the factory boot.img; the unlocked bootloader shows the usual orange warning)"
@@ -1846,5 +1887,5 @@ jobs:
               echo "- Install the MATCHING KernelSU manager: ${FILE_NAME}-manager-spoofed.apk (CI run ${KSU_CI_ID}, uapi ${KSU_CI_UAPI}). An older manager leaves su missing."
             fi
             echo "- Before flashing, back up the current image: adb shell su -c 'dd if=/dev/block/by-name/boot_a of=/sdcard/boot_a-pre-ci.img'"
-            echo "- Also in the artifact: Module.symvers (CRC gate), BTF (struct-layout gate), Image, Image.lz4."
+            echo "- Also in the artifact: the two gate reports, Module.symvers, BTF, Image, Image.lz4."
           } >> "$GITHUB_STEP_SUMMARY"

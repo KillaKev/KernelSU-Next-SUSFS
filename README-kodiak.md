@@ -125,6 +125,20 @@ Output: `<name>-boot.img` is the factory `boot.img` with its kernel swapped by `
 factory ones (`verify_boot_img.py` checks this and that the kernel inside is byte-identical to the
 built `Image`). `<name>-AnyKernel3.zip` is still produced for KernelFlasher.
 
+**Automatic gates** (no manual step): after the build, the workflow pulls the stock side out of the
+factory image it already read and runs two checks. A red gate fails the job, but the artifacts are
+still uploaded, and the run summary shows both results.
+
+- `crc_gate.py` - every module the phone loads (the `vendor_kernel_boot` ramdisk + `vendor_dlkm` +
+  `system_dlkm`, ~400 `.ko`; the running filesystem only shows about half) against this kernel's
+  `Module.symvers`. `rust_binder` is excluded: its Rust symbol names carry a crate hash, so it cannot
+  load on any non-Google build, and the phone uses the built-in binder.
+- `struct_gate.py` - no struct that vendor modules access (`task_struct`, `tcp_sock`, `sk_buff`, ...)
+  moved a member or changed size, compared with the stock kernel's own BTF (cut out of its `Image`).
+  Other structs are only counted: hundreds legitimately differ between builds and no module touches them.
+
+Reports: `<name>-crc-report.txt`, `<name>-struct-report.txt`.
+
 Expect **~45–90 minutes** for `ksu-susfs` (kleaf `--config=fast --config=stamp`, one
 architecture, no GKI module build).
 
