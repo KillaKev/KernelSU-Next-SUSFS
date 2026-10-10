@@ -251,6 +251,14 @@ def analyse(symvers, module_dir):
 
 
 # ------------------------------------------------------------------------------- reporting
+def _append(path, line):
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line + chr(10))
+    except OSError:
+        pass
+
+
 def report(res, report_path, ignored=()):
     # Modules named with --ignore-module are shown but do not turn the gate red. Used for modules
     # the phone does not load on ANY custom kernel (rust_binder: its Rust symbol names carry a crate
@@ -317,10 +325,14 @@ def report(res, report_path, ignored=()):
         # A module that cannot be read cannot be judged, and everything that imports its symbols then
         # looks "not exported". That is a problem with the gate's input, not a verdict on the kernel -
         # and it must never read as GREEN.
-        print(chr(10) + "GATE: INCONCLUSIVE - %d module file(s) could not be read (see above); this is an "
-              "extraction problem, not a verdict on the kernel" % len(res["unreadable"]))
+        verdict = ("GATE: INCONCLUSIVE - %d module file(s) could not be read (see above); this is an "
+                   "extraction problem, not a verdict on the kernel" % len(res["unreadable"]))
+        print(chr(10) + verdict)
+        _append(report_path, verdict)
         return 2
-    print(chr(10) + "GATE: %s" % ("RED - do NOT flash this kernel" if fail else "GREEN - safe to flash"))
+    verdict = "GATE: %s" % ("RED - do NOT flash this kernel" if fail else "GREEN - safe to flash")
+    print(chr(10) + verdict)
+    _append(report_path, verdict)
     return 1 if fail else 0
 
 
