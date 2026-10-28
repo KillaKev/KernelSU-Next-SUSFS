@@ -533,8 +533,9 @@ jobs:
           # not fooled by a version string.
           KSU_TREE="$GITHUB_WORKSPACE/kernel/KernelSU-Next/kernel"
           if [ -d "$KSU_TREE" ]; then
-            SYMS=$(grep -rhoE '\bsusfs_[a-z0-9_]+\(' "$KSU_TREE" --include='*.c' --include='*.h' 2>/dev/null \
-                   | tr -d '(' | sort -u || true)
+            # Comments and string literals are stripped first (RUN #9: the fork's tip documents its
+            # SUSFS port in comments and looks symbols up by name, which a plain grep read as calls).
+            SYMS=$(python3 -I "$GITHUB_WORKSPACE/.github/scripts/kodiak/susfs_calls.py" "$KSU_TREE")
             MISSING=""; OURS=""
             for sym in $SYMS; do
               # 1. declared by the SUSFS we just installed?
@@ -549,7 +550,9 @@ jobs:
               #    definition line in a .c (line starts with a type / static [inline]), also counts.
               if grep -rqE "\b${sym}\b" "$KSU_TREE" --include='*.h' 2>/dev/null \
                  || grep -rqE "^[[:space:]]*(static[[:space:]]+)?(inline[[:space:]]+)?[A-Za-z_][A-Za-z0-9_[:space:]\*]*\b${sym}[[:space:]]*\(" \
-                      "$KSU_TREE" --include='*.c' 2>/dev/null; then
+                      "$KSU_TREE" --include='*.c' 2>/dev/null \
+                 || grep -rqE "\(\*[[:space:]]*${sym}[[:space:]]*\)" "$KSU_TREE" --include='*.c' --include='*.h' 2>/dev/null; then
+                # (the last alternative: a function-pointer variable, e.g. static void (*susfs_put_mark_fn)(...))
                 OURS="$OURS $sym"
                 continue
               fi
