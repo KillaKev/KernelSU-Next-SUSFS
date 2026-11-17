@@ -682,7 +682,7 @@ jobs:
           # exactly what this step is for):
           #   req  a patch the feature *is*. If it does not apply, the kernel would be
           #        wrong rather than merely less hardened, so the run stops.
-          #   opt  a hardening/upstream fix. Their tree is 6.12.93 and ours is 6.12.69, so
+          #   opt  a hardening/upstream fix. Their tree is 6.12.93 and ours is older, so
           #        a hunk can sit on a line that a later stable backport rewrote - that is
           #        what killed d39156040e (fs/binfmt_misc.c:983). Run #30 - the kernel that
           #        boots with root and Wi-Fi - has none of these, so skipping one is safe,
@@ -700,12 +700,12 @@ jobs:
             echo "      ($NOTE)"
             if ! git apply --check $EXCL "$P" 2>"$TMP/err"; then
               if [ "$TIER" = "req" ]; then
-                echo "::error::$SHA is REQUIRED and does not apply cleanly to this 6.12.69 tree"
+                echo "::error::$SHA is REQUIRED and does not apply cleanly to this $KERNEL_VERSION tree"
                 sed 's/^/      /' "$TMP/err" | head -30 || true
                 echo "::error::forward-port this one by hand - do not fuzz it: a fuzzed hunk lands in the wrong function and still builds"
                 exit 1
               fi
-              echo "::warning::$SHA is optional and does not apply to 6.12.69 - SKIPPED, not fuzzed"
+              echo "::warning::$SHA is optional and does not apply to $KERNEL_VERSION - SKIPPED, not fuzzed"
               sed 's/^/      /' "$TMP/err" | head -12 || true
               NSKIP=$((NSKIP+1)); SKIPPED="$SKIPPED $SHA"
               continue
@@ -767,9 +767,9 @@ jobs:
 
           PATCHES
           echo
-          echo "applied $N heybooboo feature patches on top of 6.12.69"
+          echo "applied $N heybooboo feature patches on top of $KERNEL_VERSION"
           if [ "$NSKIP" -gt 0 ]; then
-            echo "::warning::skipped $NSKIP optional patch(es) that do not fit 6.12.69:$SKIPPED"
+            echo "::warning::skipped $NSKIP optional patch(es) that do not fit $KERNEL_VERSION:$SKIPPED"
             echo "skipped (optional, this tree does not have their 6.12.93 context):$SKIPPED"
           fi
           echo "FEATURE_PATCHES=heybooboo-phase12 applied=$N skipped=${NSKIP}${SKIPPED}" >> "$GITHUB_ENV"
