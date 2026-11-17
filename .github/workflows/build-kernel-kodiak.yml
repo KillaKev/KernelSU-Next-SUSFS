@@ -830,8 +830,13 @@ jobs:
           set -o pipefail
           cd "$GITHUB_WORKSPACE/kernel/common"
           # One rebased patch per tree shape (phase3-bore.patch = 6.12.69, phase3-bore-6.12.92.patch =
-          # 6.12.92 and the sublevels around it). The first one that applies STRICTLY is used; nothing is
-          # fuzzed. If none fits, the tree needs a new rebase (see build_phase3.py in the workspace).
+          # 6.12.92 and the sublevels around it, phase3-bore-6.12.81.patch = 6.12.81 - kodiak
+          # CP4A.261105.040.D1's stock kernel f5369e7496cb - and also the later 6.12.69 stock kernel
+          # 70777328ed0e of CD1A.261005.003). The 6.12.81 one is phase3-bore.patch with two hunks
+          # re-anchored, no code changed: core.c lost the trace/hooks/blk.h include the BORE include
+          # sat after, and update_curr() gained update_min_vruntime() before the entity_is_task block.
+          # Each tree accepts exactly one of the three. The first one that applies STRICTLY is used;
+          # nothing is fuzzed. If none fits, the tree needs a new rebase (see build_phase3.py in the workspace).
           P=""
           for C in "$GITHUB_WORKSPACE"/.github/scripts/kodiak/patches/phase3-bore*.patch; do
             if git apply --check "$C" 2>/dev/null; then P="$C"; break; fi
