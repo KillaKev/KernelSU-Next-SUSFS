@@ -202,7 +202,7 @@ jobs:
           python3 "$S/extract_stock.py" --stock "$GITHUB_WORKSPACE/stock" --out "$P/gate"
           rc=0
           python3 "$S/crc_gate.py" --symvers "$P/vmlinux.symvers" \
-            --modules "$P/gate/modules" --ignore-module rust_binder \
+            --modules "$P/gate/modules" --ignore-module rust_binder --crc-only \
             --report "$P/crc-precheck-report.txt" || rc=$?
           sudo rm -rf "$P/gate"
           if [ "$rc" = "1" ]; then

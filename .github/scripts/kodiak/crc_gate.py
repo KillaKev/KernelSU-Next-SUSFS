@@ -259,12 +259,17 @@ def _append(path, line):
         pass
 
 
-def report(res, report_path, ignored=()):
+def report(res, report_path, ignored=(), crc_only=False):
     # Modules named with --ignore-module are shown but do not turn the gate red. Used for modules
     # the phone does not load on ANY custom kernel (rust_binder: its Rust symbol names carry a crate
     # hash, so the CRCs differ for every non-Google build; binder itself is built in).
     skipped = [f for f in res["failures"] if f[0] in ignored]
     fail = [f for f in res["failures"] if f[0] not in ignored]
+    # --crc-only: the symvers is Google's vmlinux.symvers (pre-build check), which lists vmlinux
+    # exports only - symbols that GKI modules such as kunit.ko export are absent from it, so
+    # "not exported" cannot be judged there. Those rows are shown but do not turn the gate red.
+    unjudged = [f for f in fail if crc_only and f[4] == "missing"]
+    fail = [f for f in fail if f not in unjudged]
     out = []
     add = out.append
     add("crc_gate - device module loadability against a built kernel")
@@ -272,6 +277,9 @@ def report(res, report_path, ignored=()):
     add("modules checked      : %d" % res["mods"])
     add("symbol imports       : %d matched, %d cross-module (device-to-device)" % (res["oks"], res["intermod"]))
     add("HARD FAILURES        : %d" % len(fail))
+    if unjudged:
+        add("not judged (--crc-only): %d symbol(s) absent from vmlinux.symvers in %s"
+            % (len(unjudged), ", ".join(sorted({f[0] for f in unjudged}))))
     if skipped:
         add("ignored (known)      : %d symbol(s) in %s" % (len(skipped), ", ".join(sorted({f[0] for f in skipped}))))
     add("vermagic flag set(s) : %s" % (" | ".join(sorted(res["flags"])) or "(none)"))
@@ -343,13 +351,16 @@ def main(argv=None):
     ap.add_argument("--symvers", required=True, help="Module.symvers from the CI artifact")
     ap.add_argument("--modules", required=True, help="directory holding the device's .ko files")
     ap.add_argument("--report", default="crc_report.txt", help="write the full report here")
+    ap.add_argument("--crc-only", action="store_true",
+                    help="judge CRC mismatches only; symbols missing from --symvers are listed, not failed "
+                         "(for a vmlinux-only symvers, which lacks GKI module exports)")
     ap.add_argument("--ignore-module", action="append", default=[],
                     help="module whose failures are reported but do not fail the gate (repeatable)")
     args = ap.parse_args(argv)
     rc, res = analyse(args.symvers, args.modules)
     if res is None:
         return rc
-    return report(res, args.report, set(args.ignore_module))
+    return report(res, args.report, set(args.ignore_module), args.crc_only)
 
 
 if __name__ == "__main__":
