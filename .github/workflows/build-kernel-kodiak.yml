@@ -31,7 +31,9 @@ name: Build GKI kernel (KernelSU-Next + SUSFS) - Pixel 11 Pro XL / kodiak
 #   The 128 vendor modules on the phone were built against the android16-6.12 KMI. With
 #   CONFIG_MODVERSIONS=y the kernel compares symbol CRCs, which are frozen per KMI generation, so
 #   the kernel MUST come from the same KMI line as the factory kernel (the resolver refuses
-#   anything else). Any dated release of that line is CRC-safe.
+#   anything else). The same KMI line is NOT enough on its own (run #65: a 6.12.81 factory image
+#   vs 6.12.92 = 6651 CRC mismatches), so for kernel != match a pre-build gate checks the target
+#   release's published CRCs against the factory image's modules before anything is compiled.
 #
 # A note on refs: SUSFS lives on GITLAB (gitlab.com/simonpunk/susfs4ksu), not GitHub, and its
 #   patches target a specific KernelSU. We therefore use the SUSFS fork of KernelSU-Next
@@ -169,6 +171,46 @@ jobs:
           rm -rf "$RUNNER_TEMP/factory"
           echo "FILE_NAME=$(grep '^FILE_NAME=' "$GITHUB_ENV" | tail -1 | cut -d= -f2)-${{ inputs.patches }}" >> "$GITHUB_ENV"
           df -h / | tail -1
+
+      # ------------------------------------------------- 2c. CRC pre-check (kernel != match only)
+      # RUN #65 LESSON: "any release of the same KMI is CRC-safe" is NOT true. kodiak
+      # CP4A.261105.040.D1 ships 6.12.81 and its vendor modules expect CRCs that no 6.12.92 release
+      # exports (6651 mismatches in 354 modules, Wi-Fi included) - yet CD1A.261005.003 (6.12.69) was
+      # fine with the same 6.12.92. The post-build gate caught it, but only after a 30-minute build.
+      #
+      # This answers the same question BEFORE the build: Google publishes vmlinux.symvers for every
+      # certified GKI build on ci.android.com, and for vmlinux symbols it carries exactly the CRCs our
+      # build exports (verified on runs #64/#65: identical apart from Rust symbols and the tcp_* that
+      # the BBR patches change - neither is imported by vendor modules). So crc_gate.py is run against
+      # it with the factory image's modules. kernel=match builds the stock commit and skips this
+      # (the stock ab build is not public); the post-build gate still checks every build.
+      - name: Gate - target release CRCs vs the factory image's modules (pre-build)
+        if: ${{ startsWith(env.KERNEL_MODE, 'other release') }}
+        run: |
+          set -o pipefail
+          S="$GITHUB_WORKSPACE/.github/scripts/kodiak"
+          P="$RUNNER_TEMP/precheck"
+          URL="https://ci.android.com/builds/submitted/${BUILD_NUMBER}/kernel_aarch64/latest/raw/vmlinux.symvers"
+          mkdir -p "$P"
+          if ! curl -fsSL --retry 4 --retry-delay 5 -o "$P/vmlinux.symvers" "$URL" || [ ! -s "$P/vmlinux.symvers" ]; then
+            echo "::warning::no vmlinux.symvers for ab${BUILD_NUMBER} ($KERNEL_TAG) on ci.android.com - pre-build CRC check skipped; the post-build gate still runs"
+            exit 0
+          fi
+          echo "target CRCs: $URL ($(wc -l < "$P/vmlinux.symvers") symbols)"
+          sudo apt-get -qq update
+          sudo apt-get -qq install -y erofs-utils python3-lz4
+          python3 "$S/extract_stock.py" --stock "$GITHUB_WORKSPACE/stock" --out "$P/gate"
+          rc=0
+          python3 "$S/crc_gate.py" --symvers "$P/vmlinux.symvers" \
+            --modules "$P/gate/modules" --ignore-module rust_binder \
+            --report "$P/crc-precheck-report.txt" || rc=$?
+          sudo rm -rf "$P/gate"
+          if [ "$rc" = "1" ]; then
+            echo "::error::$KERNEL_TAG ($KERNEL_VERSION) is not CRC-compatible with the vendor modules of $FACTORY_BUILD (stock kernel $STOCK_RELEASE) - building it would give a kernel that must not be flashed. Rerun with kernel: match, or pick a release closer to the stock kernel."
+          elif [ "$rc" != "0" ]; then
+            echo "::error::pre-build CRC check was INCONCLUSIVE (rc=$rc) - see the log above"
+          fi
+          exit $rc
 
       # ------------------------------------------------- 3. kernel source (manifest)
       # Google's kernel is a multi-repo tree (common + build + prebuilts), so `repo` - not a
