@@ -520,6 +520,32 @@ jobs:
           cp -v "$S"/kernel_patches/fs/*            fs/
           cp -v "$S"/kernel_patches/include/linux/* include/linux/
           cp -v "$PATCH" ./
+          # RUN #67 LESSON: since SUSFS bd27568 ("rebase susfs patches onto android16-6.12.92") the
+          # patch's fs/proc/task_mmu.c section targets the NEW show_smaps_rollup() (proc_get_vma,
+          # goto out_unlock). Trees that still have the OLD do { smap_gather_stats(vma, &mss, 0) }
+          # loop - kodiak's stock 6.12.81 (CP4A.261105.040.D1) and 6.12.69 (CD1A.261005.003) - do
+          # not reject those hunks: -F3 lands them OUTSIDE the function, and the build dies 30 min in
+          # (task_mmu.c: "expected identifier or '('" at the goto, "bypass_orig_flow:" at file scope).
+          # For those trees, swap in the task_mmu.c section of acb92d4 - simonpunk's own last patch
+          # for the old loop. It differs from the tip's section ONLY in the show_smaps_rollup hunks
+          # (+ vma_pages vs vma_data_pages context), and applies to both trees at fuzz 0.
+          if grep -q 'smap_gather_stats(vma, &mss, 0);' fs/proc/task_mmu.c; then
+            OLDTM="$GITHUB_WORKSPACE/.github/scripts/kodiak/patches/susfs-task_mmu-old-rollup.patch"
+            echo "  [old rollup] fs/proc/task_mmu.c has the pre-6.12.92 show_smaps_rollup loop - using $(basename "$OLDTM")"
+            python3 - "$(basename "$PATCH")" "$OLDTM" <<'PY'
+          import re, sys
+          path, old = sys.argv[1], open(sys.argv[2], encoding="utf-8").read()
+          src = open(path, encoding="utf-8").read()
+          parts = re.split(r"(?m)^(?=diff --git )", src)
+          hits = [i for i, p in enumerate(parts) if p.startswith("diff --git a/fs/proc/task_mmu.c ")]
+          if len(hits) != 1:
+              sys.exit("::error::expected exactly one fs/proc/task_mmu.c section in %s, found %d" % (path, len(hits)))
+          before = parts[hits[0]].count("\n@@ ")
+          parts[hits[0]] = old
+          open(path, "w", encoding="utf-8").write("".join(parts))
+          print("  [old rollup] replaced the task_mmu.c section (%d hunks -> %d hunks)" % (before, old.count("\n@@ ")))
+          PY
+          fi
           echo "---- applying $(basename "$PATCH") ----"
           patch -p1 --forward -F3 < "$(basename "$PATCH")" || echo "::warning::patch reported rejects - the gate below decides"
 
