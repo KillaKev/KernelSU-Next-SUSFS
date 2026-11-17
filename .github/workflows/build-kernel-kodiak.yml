@@ -31,8 +31,7 @@ name: Build GKI kernel (KernelSU-Next + SUSFS) - Pixel 11 Pro XL / kodiak
 #   The 128 vendor modules on the phone were built against the android16-6.12 KMI. With
 #   CONFIG_MODVERSIONS=y the kernel compares symbol CRCs, which are frozen per KMI generation, so
 #   the kernel MUST come from the same KMI line as the factory kernel (the resolver refuses
-#   anything else). The same KMI line is NOT enough on its own (run #65: a 6.12.81 factory image
-#   vs 6.12.92 = 6651 CRC mismatches), so for kernel != match a pre-build gate checks the target
+#   anything else). Rather than trust that, for kernel != match a pre-build gate checks the target
 #   release's published CRCs against the factory image's modules before anything is compiled.
 #
 # A note on refs: SUSFS lives on GITLAB (gitlab.com/simonpunk/susfs4ksu), not GitHub, and its
@@ -173,10 +172,10 @@ jobs:
           df -h / | tail -1
 
       # ------------------------------------------------- 2c. CRC pre-check (kernel != match only)
-      # RUN #65 LESSON: "any release of the same KMI is CRC-safe" is NOT true. kodiak
-      # CP4A.261105.040.D1 ships 6.12.81 and its vendor modules expect CRCs that no 6.12.92 release
-      # exports (6651 mismatches in 354 modules, Wi-Fi included) - yet CD1A.261005.003 (6.12.69) was
-      # fine with the same 6.12.92. The post-build gate caught it, but only after a 30-minute build.
+      # The post-build CRC gate answers "will the phone's modules load?" only after a 30-minute build.
+      # (Run #65's red there was NOT a real incompatibility: CP4A.261105.040.D1 added a 16k-page
+      # module set to vendor_boot that overwrote the 4k one in the gate's input - fixed in
+      # extract_stock.py. Its 4k modules match 6.12.92 r16 exactly.)
       #
       # This answers the same question BEFORE the build: Google publishes vmlinux.symvers for every
       # certified GKI build on ci.android.com, and for vmlinux symbols it carries exactly the CRCs our

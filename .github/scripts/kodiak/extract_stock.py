@@ -23,6 +23,7 @@ erofs support: the kernel's erofs driver via a loop mount (sudo), or `fsck.erofs
 import argparse
 import gzip
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -216,6 +217,57 @@ def find_btf(img):
 
 
 # ------------------------------------------------------------------------------ main
+# ------------------------------------------------------------------------- page-size filter
+PAGE_RE = re.compile(r"-(\d+k)$")
+
+
+def page_suffix(release):
+    """'6.12.81-android16-6-g...-ab16530091-4k' -> '4k'; no suffix (the 16k build) -> ''."""
+    m = PAGE_RE.search(release)
+    return m.group(1) if m else ""
+
+
+def drop_other_page_size(mods, aside, image):
+    """Move every module built for a different page size than the stock kernel out of `mods`.
+
+    Since CP4A.261105.040.D1 the factory image also ships a 16k-page kernel (kernel_16k) and its own
+    module set in vendor_boot's ramdisk. Those modules are never loaded by the 4k kernel we replace,
+    and their CRCs legitimately differ from it (page size reaches the types genksyms hashes) - so
+    judging them made run #69's gate red on 5995 symbols although every 4k module matched exactly.
+    The page size is read from the vermagic release suffix (-4k / none), compared with the stock
+    kernel's banner."""
+    from crc_gate import Elf  # same directory
+    data = open(image, "rb").read() if os.path.exists(image) else b""
+    m = re.search(rb"Linux version (\S+)", data)
+    if not m:
+        die("no 'Linux version' banner in %s - cannot tell which page size the stock kernel uses" % image)
+    want = page_suffix(m.group(1).decode("ascii", "replace"))
+    kept, moved = {}, {}
+    for root, _d, files in os.walk(mods):
+        for f in files:
+            if not f.endswith(".ko"):
+                continue
+            path = os.path.join(root, f)
+            try:
+                release = Elf(path).modinfo().get("vermagic", "").split(" ", 1)[0]
+            except Exception:  # noqa: BLE001 - unreadable files are crc_gate's to report
+                continue
+            if page_suffix(release) == want:
+                kept[release] = kept.get(release, 0) + 1
+                continue
+            dest = os.path.join(aside, os.path.relpath(path, mods))
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            os.replace(path, dest)
+            moved[release] = moved.get(release, 0) + 1
+    print("stock kernel page size: %s" % (want or "(no suffix)"))
+    for rel, c in sorted(kept.items()):
+        print("  kept  %4d module(s) built for %s" % (c, rel))
+    for rel, c in sorted(moved.items()):
+        print("  SKIP  %4d module(s) built for %s - another page size, never loaded by this kernel" % (c, rel))
+    if not kept:
+        die("no module matches the stock kernel's page size (%s)" % (want or "none"))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--stock", required=True)
@@ -226,16 +278,20 @@ def main():
     mods = os.path.join(a.out, "modules")
 
     n = 0
-    rd = os.path.join(mods, "ramdisk")
-    os.makedirs(rd, exist_ok=True)
-    # first-stage modules: vendor_kernel_boot on current Pixels, vendor_boot on older layouts
+    # first-stage modules: vendor_kernel_boot on current Pixels, vendor_boot on older layouts.
+    # One directory PER IMAGE: CP4A.261105.040.D1's vendor_boot carries a second, 16k-page module set
+    # with the same file names, and a shared directory let those overwrite the 4k ones (run #69).
     for img in ("vendor_kernel_boot.img", "vendor_boot.img"):
         p = os.path.join(a.stock, img)
         if not os.path.exists(p):
             continue
-        for frag in vendor_ramdisks(p):
+        rd = os.path.join(mods, "ramdisk", img[:-4])
+        os.makedirs(rd, exist_ok=True)
+        for i, frag in enumerate(vendor_ramdisks(p)):
             for name, blob in cpio_modules(frag):
-                with open(os.path.join(rd, os.path.basename(name)), "wb") as f:
+                dest = os.path.join(rd, "frag%d" % i, os.path.basename(name))
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with open(dest, "wb") as f:
                     f.write(blob)
                 n += 1
         print("%s ramdisk: %d modules so far" % (img, n))
@@ -248,6 +304,7 @@ def main():
             extract_erofs(img, os.path.join(mods, part))
 
     k = os.path.join(a.stock, "Image")
+    drop_other_page_size(mods, os.path.join(a.out, "other-page-size"), k)
     if os.path.exists(k):
         blob = find_btf(open(k, "rb").read())
         with open(os.path.join(a.out, "stock.btf"), "wb") as f:
